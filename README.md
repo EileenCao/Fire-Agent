@@ -341,7 +341,6 @@ python -m pytest -q
 FireAgent/
 ├─ AGENTS.md                         # 项目级 Agent 路由与安全约束
 ├─ README.md
-├─ docs/stock-research-system-design.md
 ├─ skills/
 │  ├─ strategy-workbench/SKILL.md
 │  ├─ backtest-analysis/SKILL.md
@@ -457,8 +456,4 @@ python -m mcp_server.cli preview --report-date YYYY-MM-DD
 python -m mcp_server.cli daily-report --send
 ```
 
-自定义机器人请求体不能超过 20 KB，适配器默认按 18 KiB 安全阈值拆分并重试；Webhook 签名和错误信息会脱敏。当前方案是单向定时推送，不支持在飞书里与 Agent 双向对话；双向对话需要后续接入飞书应用机器人和消息事件桥接。完整手工任务计划和故障排查见 [`docs/feishu-scheduled-notification-design.md`](docs/feishu-scheduled-notification-design.md)。
-
-## 设计文档与路线
-
-完整的边界、数据模型、MCP 接口、策略回测语义和证据链见 [`docs/stock-research-system-design.md`](docs/stock-research-system-design.md)；飞书午间推送的实现细节见 [`docs/feishu-scheduled-notification-design.md`](docs/feishu-scheduled-notification-design.md)。当前路线是：本地依赖检查与回测闭环 → 日维度观察与分析建议 → 飞书单向定时推送 → 更丰富的渠道与云端调度。
+自定义机器人请求体不能超过 20 KB，适配器默认按 18 KiB 安全阈值拆分并重试；Webhook 签名和错误信息会脱敏。当前方案是单向定时推送，不支持在飞书里与 Agent 双向对话；双向对话需要后续接入飞书应用机器人和消息事件桥接。完整的任务计划配置和故障排查请直接参阅本文对应章节。
