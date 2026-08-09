@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from mcp_server.services.historical_data import (
+    AStockDailyBarsFetcher,
     HistoricalDataResult,
     WorkspaceHistoricalDataProvider,
 )
@@ -46,6 +47,34 @@ class _ReusableCache:
             {"date": "2026-01-01", "open": 10, "high": 11, "low": 9, "close": 10},
             {"date": "2026-01-02", "open": 10, "high": 11, "low": 9, "close": 10},
         ]
+
+
+class _FakeResponse:
+    def __init__(self, payload):
+        self.payload = payload
+
+    def raise_for_status(self):
+        return None
+
+    def json(self):
+        return self.payload
+
+
+class _TencentSession:
+    def __init__(self):
+        self.calls = []
+        self.headers = {}
+
+    def get(self, url, params, timeout):
+        self.calls.append((url, params, timeout))
+        parts = params["param"].split(",")
+        start, end = parts[2], parts[3]
+        rows = [
+            [start, "10", "10", "11", "9", "100"],
+            ["2026-01-03", "11", "11", "12", "10", "101"],
+            [end, "12", "12", "13", "11", "102"],
+        ]
+        return _FakeResponse({"data": {"sh512890": {"qfqday": rows}}})
 
 
 def test_provider_normalizes_filters_and_records_provenance(tmp_path):
@@ -125,3 +154,24 @@ def test_provider_reuses_a_matching_parquet_snapshot(tmp_path):
     assert result.data["512890"][0]["date"] == "2026-01-01"
     assert result.provenance["per_symbol"]["512890"]["cache_hit"] is True
     assert cache.read_calls == 1
+
+
+def test_tencent_fetcher_segments_date_ranges_and_deduplicates_rows():
+    session = _TencentSession()
+    fetcher = AStockDailyBarsFetcher(session=session, segment_days=2)
+
+    bars = fetcher("512890", "SH", "2026-01-01", "2026-01-05")
+
+    assert len(session.calls) == 3
+    for _, params, _ in session.calls:
+        parts = params["param"].split(",")
+        assert parts[0] == "sh512890"
+        assert parts[1] == "day"
+        assert len(parts[2]) == 10 and parts[2][4] == "-" and parts[2][7] == "-"
+        assert len(parts[3]) == 10 and parts[3][4] == "-" and parts[3][7] == "-"
+        assert int(parts[4]) <= 640
+        assert parts[5] == "qfq"
+    dates = [bar["date"] for bar in bars]
+    assert dates == sorted(set(dates))
+    assert dates[0] == "2026-01-01"
+    assert dates[-1] == "2026-01-05"

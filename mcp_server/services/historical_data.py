@@ -214,7 +214,13 @@ class AStockDailyBarsFetcher:
     fallback table. The response is converted to the engine's stable field names.
     """
 
-    def __init__(self, session=None, timeout: int = 20):
+    def __init__(
+        self,
+        session=None,
+        timeout: int = 20,
+        segment_days: int = 365,
+        max_rows: int = 640,
+    ):
         if session is None:
             try:
                 import requests
@@ -227,6 +233,10 @@ class AStockDailyBarsFetcher:
                 ) from exc
         self.session = session
         self.timeout = timeout
+        if segment_days < 1:
+            raise ValueError("Tencent historical segment_days must be positive")
+        self.segment_days = int(segment_days)
+        self.max_rows = min(max(1, int(max_rows)), 640)
 
     def __call__(
         self,
@@ -235,20 +245,42 @@ class AStockDailyBarsFetcher:
         start_date: date,
         end_date: date,
     ) -> List[Dict[str, Any]]:
-        days = max((end_date - start_date).days + 365, 1200)
-        url = SOURCE_URL
-        params = {
-            "param": "{},day,,,{},qfq".format(market.lower() + code, min(days, 10000))
-        }
-        response = self.session.get(url, params=params, timeout=self.timeout)
-        if hasattr(response, "raise_for_status"):
-            response.raise_for_status()
-        payload = response.json()
-        node = (payload.get("data") or {}).get(market.lower() + code) or {}
-        rows = node.get("qfqday") or []
-        if not rows:
+        start = _as_date(start_date)
+        end = _as_date(end_date)
+        if start > end:
+            raise ValueError("Tencent historical start date must not be after end date")
+
+        merged: Dict[str, Dict[str, Any]] = {}
+        symbol = market.lower() + code
+        for segment_start, segment_end in _date_segments(
+            start, end, self.segment_days
+        ):
+            params = {
+                "param": "{},{},{},{},{},qfq".format(
+                    symbol,
+                    "day",
+                    segment_start.isoformat(),
+                    segment_end.isoformat(),
+                    self.max_rows,
+                )
+            }
+            response = self.session.get(
+                SOURCE_URL, params=params, timeout=self.timeout
+            )
+            if hasattr(response, "raise_for_status"):
+                response.raise_for_status()
+            payload = response.json()
+            node = (payload.get("data") or {}).get(symbol) or {}
+            rows = node.get("qfqday") or node.get("day") or []
+            for row in rows:
+                bar = _row_to_bar(row)
+                day = _as_date(str(bar["date"])[:10])
+                if start <= day <= end:
+                    merged[day.isoformat()] = bar
+
+        if not merged:
             raise HistoricalDataError("腾讯前复权日线返回为空：{}".format(code))
-        return [_row_to_bar(row) for row in rows]
+        return [merged[key] for key in sorted(merged)]
 
 
 def resolve_strategy_window(spec, today: Optional[date] = None) -> Tuple[date, date]:
@@ -343,9 +375,19 @@ def _row_to_bar(row: Any) -> Dict[str, Any]:
 
 
 def _as_date(value: Any) -> date:
+    if isinstance(value, datetime):
+        return value.date()
     if isinstance(value, date):
         return value
     return date.fromisoformat(str(value))
+
+
+def _date_segments(start: date, end: date, segment_days: int):
+    current = start
+    while current <= end:
+        segment_end = min(end, current + timedelta(days=segment_days - 1))
+        yield current, segment_end
+        current = segment_end + timedelta(days=1)
 
 
 def _number(value: Any) -> Optional[float]:

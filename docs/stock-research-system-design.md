@@ -303,7 +303,7 @@ FireAgent/
 
 真实 A 股数据的唯一允许入口是已安装且版本满足要求的 `a-stock-data` Skill。启动检查支持 `A_STOCK_DATA_SKILL_PATH` 覆盖路径，默认检查 Codex、Agents 和 Claude Code 的用户 Skill 目录，并验证 frontmatter 中的名称和版本。`doctor`、生产 MCP 服务和真实数据回测启动时都执行检查；失败时返回安装依赖、路径和版本修复提示。
 
-项目保留腾讯行情适配器作为 MCP 边界适配层，并通过历史 Provider 使用 Skill 认可的腾讯前复权日线线路；它不能替代 Skill 的来源路由和备用源规则。后续接入财务、研报、公告、ETF 估值等数据时，必须遵守 Skill 的通达信/腾讯优先、东财串行限流与会话复用、备用源降级和代码归一化规则。
+项目保留腾讯行情适配器作为 MCP 边界适配层，并通过历史 Provider 使用 Skill 认可的腾讯前复权日线线路；它不能替代 Skill 的来源路由和备用源规则。腾讯接口单次默认最多返回最近约 640 条记录，Provider 必须使用 `YYYY-MM-DD` 日期参数按日期段分段请求，单次上限不超过 640，然后合并、按日期去重并排序，防止长历史窗口被截断。后续接入财务、研报、公告、ETF 估值等数据时，必须遵守 Skill 的通达信/腾讯优先、东财串行限流与会话复用、备用源降级和代码归一化规则。
 
 每个指标或数据快照都应记录：`source_name`、`source_url`、`source_version`、`skill_name`、`skill_version`、实际数据时间、采集时间、口径、状态和错误原因。真实回测的结果中必须保留 Skill 版本和数据来源；单元测试可以注入假数据 Provider，但不能用假数据绕过生产启动检查。
 
@@ -311,7 +311,7 @@ FireAgent/
 
 ### 本地 Agent 集成与同步边界
 
-`a-stock-data` 是 Agent Skill：它提供数据源规则和可执行的 Python 取数代码（包括历史 K 线调用），但本身不是一个运行中的 MCP Server，也不会出现在 FireAgent 的 `tools/list` 中。FireAgent 的历史 Provider 目前通过 Skill 认可的腾讯前复权日线线路自动取数，并保留来源、URL、请求区间、数据区间、复权口径和 Skill 版本；后续可在该 Provider 内增加通达信及其他已定义备用源，不改变 MCP 和回测引擎接口。
+`a-stock-data` 是 Agent Skill：它提供数据源规则和可执行的 Python 取数代码（包括历史 K 线调用），但本身不是一个运行中的 MCP Server，也不会出现在 FireAgent 的 `tools/list` 中。FireAgent 的历史 Provider 目前通过 Skill 认可的腾讯前复权日线线路自动取数；请求长窗口时按日期段拆分，参数日期固定为 `YYYY-MM-DD`，并在返回后合并、按日期去重排序。Provider 保留来源、URL、请求区间、数据区间、复权口径和 Skill 版本；后续可在该 Provider 内增加通达信及其他已定义备用源，不改变 MCP 和回测引擎接口。
 
 项目提供 `python -m mcp_server.cli sync` 作为本地同步命令。它要求先完成 `init --workspace <用户确认路径>`，然后检查必需的 `a-stock-data` Skill、三个项目 Skill，并生成被 Git 忽略的 `.codex/config.toml`；配置中固定项目根目录、独立工作区、SQLite 和交易日历路径。它不会修改用户全局 Codex 配置，也不会重新安装 Skill。代码或 Skill 文档修改后再次运行该命令即可更新项目级配置和检查结果。若 MCP 进程已经启动，仍需重启 MCP 或新开任务以加载新的 Python 代码。
 
