@@ -1,5 +1,4 @@
 """Deterministic daily-bar engine with explicit A-share execution constraints."""
-
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from math import floor
@@ -7,6 +6,12 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from mcp_server.domain.identifiers import normalize_ticker
 from mcp_server.services.indicators import build_indicator_series
+from mcp_server.services.layered_sizing import (
+    build_ladder_state,
+    resolve_ladder_level,
+    resolve_tactical_cash,
+)
+from mcp_server.services.performance import calculate_performance_metrics
 from mcp_server.services.signal_planner import build_signal_plan
 
 
@@ -65,9 +70,9 @@ class PositionBook:
     def add(self, lot: PositionLot) -> None:
         self.lots.append(lot)
 
-    def sell(self, quantity: int, day: str) -> Tuple[int, List[Tuple[str, int, float]]]:
+    def sell(self, quantity: int, day: str) -> Tuple[int, List[Dict[str, Any]]]:
         remaining = max(0, int(quantity))
-        allocations: List[Tuple[str, int, float]] = []
+        allocations: List[Dict[str, Any]] = []
         for lot in self.lots:
             if remaining <= 0:
                 break
@@ -81,7 +86,18 @@ class PositionBook:
             lot.cost -= allocated_cost
             lot.fees -= allocated_fees
             remaining -= sold
-            allocations.append((lot.lot_id, sold, allocated_cost))
+            allocations.append(
+                {
+                    "lot_id": lot.lot_id,
+                    "buy_date": lot.buy_date,
+                    "quantity": sold,
+                    "allocated_cost": allocated_cost,
+                    "allocated_fees": allocated_fees,
+                    "holding_days": max(
+                        0, (date.fromisoformat(day) - date.fromisoformat(lot.buy_date)).days
+                    ),
+                }
+            )
         self.lots = [lot for lot in self.lots if lot.quantity > 0]
         return quantity - remaining, allocations
 
@@ -153,18 +169,26 @@ class BacktestEngine:
 
         allocation = spec.initial_capital / max(1, len(data))
         total_equity: Dict[str, float] = {}
+        total_cash: Dict[str, float] = {}
+        total_market_value: Dict[str, float] = {}
         all_trades: List[Dict[str, Any]] = []
         all_warnings: List[str] = []
         cash_flows: List[Dict[str, Any]] = []
+        skipped_sell_signals: List[Dict[str, Any]] = []
         positions: Dict[str, Any] = {}
         for code, bars in data.items():
             outcome = self._run_symbol(spec, code, bars, allocation, scenario)
             all_trades.extend(outcome["trades"])
             all_warnings.extend(outcome["warnings"])
             cash_flows.extend(outcome["cash_flows"])
+            skipped_sell_signals.extend(outcome.get("skipped_sell_signals", []))
             positions[code] = outcome["positions"]
             for day, equity in outcome["equity_curve"].items():
                 total_equity[day] = total_equity.get(day, 0.0) + equity
+            for day, cash in outcome["cash_curve"].items():
+                total_cash[day] = total_cash.get(day, 0.0) + cash
+            for day, market_value in outcome["market_value_curve"].items():
+                total_market_value[day] = total_market_value.get(day, 0.0) + market_value
         if not total_equity:
             total_equity = {"": spec.initial_capital}
         values = [total_equity[key] for key in sorted(total_equity)]
@@ -175,18 +199,34 @@ class BacktestEngine:
             all_trades,
             cash_flows,
             positions,
+            risk_free_rate_annual=spec.risk_free_rate_annual,
+            cash_curve=total_cash,
+            market_value_curve=total_market_value,
         )
+        if skipped_sell_signals:
+            metrics["skipped_sell_signal_count"] = len(skipped_sell_signals)
         return {
             "scenario": scenario,
             "equity_curve": total_equity,
+            "cash_curve": total_cash,
+            "market_value_curve": total_market_value,
+            "exposure_curve": {
+                day: (total_market_value.get(day, 0.0) / equity if equity else 0.0)
+                for day, equity in total_equity.items()
+            },
             "trades": all_trades,
             "cash_flows": cash_flows,
             "positions": positions,
             "metrics": metrics,
             "warnings": sorted(set(all_warnings)),
+            "skipped_sell_signals": skipped_sell_signals,
         }
 
     def _run_symbol(self, spec, code, raw_bars, allocation, scenario):
+        if _uses_layered_close_execution(spec):
+            return self._run_symbol_layered_close_execution(
+                spec, code, raw_bars, allocation, scenario
+            )
         if _uses_close_execution(spec):
             return self._run_symbol_close_execution(
                 spec, code, raw_bars, allocation, scenario
@@ -203,6 +243,8 @@ class BacktestEngine:
         warnings: List[str] = []
         cash_flows: List[Dict[str, Any]] = []
         equity_curve: Dict[str, float] = {}
+        cash_curve: Dict[str, float] = {}
+        market_value_curve: Dict[str, float] = {}
         periodic_events = _periodic_events(spec, bars)
         order_number = 0
 
@@ -327,12 +369,20 @@ class BacktestEngine:
                         )
 
             equity_curve[day] = cash + book.market_value(float(bar["close"]))
+            cash_curve[day] = cash
+            market_value_curve[day] = book.market_value(float(bar["close"]))
 
         if book.total_quantity() > 0:
             warnings.append("{} 数据结束时仍有未平仓头寸，按最后收盘价估值".format(code))
         return {
             "trades": trades,
             "equity_curve": equity_curve,
+            "cash_curve": cash_curve,
+            "market_value_curve": market_value_curve,
+            "exposure_curve": {
+                day: (market_value_curve[day] / equity if equity else 0.0)
+                for day, equity in equity_curve.items()
+            },
             "warnings": warnings,
             "cash_flows": cash_flows,
             "positions": _position_snapshot(book),
@@ -350,6 +400,8 @@ class BacktestEngine:
         trades: List[Dict[str, Any]] = []
         warnings: List[str] = []
         equity_curve: Dict[str, float] = {}
+        cash_curve: Dict[str, float] = {}
+        market_value_curve: Dict[str, float] = {}
         cash_flows: List[Dict[str, Any]] = []
         order_number = 0
 
@@ -440,15 +492,253 @@ class BacktestEngine:
                         cash_flows.append(flow)
 
             equity_curve[day] = cash + book.market_value(float(bar["close"]))
+            cash_curve[day] = cash
+            market_value_curve[day] = book.market_value(float(bar["close"]))
 
         if book.total_quantity() > 0:
             warnings.append("{} 鏁版嵁缁撴潫鏃朵粛鏈夋湭骞充粨澶村锛屾寜鏈€鍚庢敹鐩樹环浼板€?".format(code))
         return {
             "trades": trades,
             "equity_curve": equity_curve,
+            "cash_curve": cash_curve,
+            "market_value_curve": market_value_curve,
+            "exposure_curve": {
+                day: (market_value_curve[day] / equity if equity else 0.0)
+                for day, equity in equity_curve.items()
+            },
             "warnings": warnings,
             "cash_flows": cash_flows,
             "positions": _position_snapshot(book),
+        }
+
+    def _run_symbol_layered_close_execution(
+        self, spec, code, raw_bars, allocation, scenario
+    ):
+        """Run a same-close strategy with independent core and tactical books."""
+
+        bars = list(raw_bars)
+        dates = [str(bar["date"]) for bar in bars]
+        lot_size = _lot_size(spec)
+        indicator_series = build_indicator_series(spec, bars)
+        core_book = PositionBook(code)
+        tactical_book = PositionBook(code)
+        cash = float(allocation)
+        core_initialized = False
+        triggered_levels = set()
+        layered_sizing = spec.position_sizing or {}
+        ladder_enabled = bool(layered_sizing.get("drawdown_ladder"))
+        core_config = layered_sizing.get("core") or {}
+        core_ratio = float(core_config.get("ratio", 0.0))
+        trades: List[Dict[str, Any]] = []
+        warnings: List[str] = []
+        equity_curve: Dict[str, float] = {}
+        cash_curve: Dict[str, float] = {}
+        market_value_curve: Dict[str, float] = {}
+        cash_flows: List[Dict[str, Any]] = []
+        skipped_sell_signals: List[Dict[str, Any]] = []
+        order_number = 0
+
+        for index, bar in enumerate(bars):
+            day = str(bar["date"])
+            next_day = _next_date(dates, day)
+            suspended = bool(bar.get("suspended") or bar.get("is_suspended"))
+            ladder_state = None
+            ladder_result = {"ladder_amount": 0.0, "new_levels": []}
+            if ladder_enabled:
+                ladder_state = build_ladder_state(spec, bars, index)
+                ladder_result = resolve_ladder_level(
+                    spec, ladder_state, triggered_levels, consume=False
+                )
+                triggered_levels = set(ladder_result["triggered_levels"])
+
+            if suspended:
+                warnings.append("{} {} 鍋滅墝锛屾棤娉曚骇鐢熸垨鎵ц浜ゆ槗".format(code, day))
+            else:
+                plan = build_signal_plan(
+                    spec,
+                    bars,
+                    index,
+                    tactical_book.total_quantity(),
+                    indicator_series=indicator_series,
+                )
+
+                if plan["entry_count"] >= 1 and not core_initialized:
+                    core_initialized = True
+                    core_cash = max(0.0, float(allocation) * core_ratio)
+                    core_evidence = dict(plan["evidence"])
+                    core_evidence.update(
+                        {
+                            "book": "core",
+                            "buy_cash": core_cash,
+                            "core_ratio": core_ratio,
+                        }
+                    )
+                    order_number += 1
+                    trade, cash, flow, order_warnings = self._execute_order(
+                        spec,
+                        code,
+                        bar,
+                        PendingOrder(
+                            code=code,
+                            side="BUY",
+                            source="CORE_BUY",
+                            signal_date=day,
+                            execute_date=day,
+                            reason="CORE_FIRST_ENTRY",
+                            config={
+                                "type": "recurrent_cash",
+                                "amount": core_cash,
+                                "lot_size": lot_size,
+                                "signal_evidence": core_evidence,
+                                "cost_basis": "weighted_average",
+                            },
+                            intraday_price=float(bar["close"]),
+                        ),
+                        core_book,
+                        cash,
+                        allocation,
+                        lot_size,
+                        next_day,
+                        order_number,
+                    )
+                    trade["book"] = "core"
+                    trades.append(trade)
+                    warnings.extend(order_warnings)
+                    if flow:
+                        cash_flows.append(flow)
+
+                if plan["action"] == "BUY":
+                    signal_evidence = dict(plan["evidence"])
+                    buy_cash = float(plan["buy_cash"])
+                    if ladder_state is not None:
+                        ladder_result = resolve_ladder_level(
+                            spec, ladder_state, triggered_levels
+                        )
+                        triggered_levels = set(ladder_result["triggered_levels"])
+                        buy_cash = resolve_tactical_cash(
+                            buy_cash, ladder_result["ladder_amount"]
+                        )
+                        signal_evidence["ladder"] = {
+                            "state": ladder_state,
+                            "new_levels": ladder_result["new_levels"],
+                            "triggered_levels": ladder_result["triggered_levels"],
+                            "ladder_amount": ladder_result["ladder_amount"],
+                        }
+                    signal_evidence["book"] = "tactical"
+                    signal_evidence["rsi_cash"] = float(plan["buy_cash"])
+                    signal_evidence["buy_cash"] = buy_cash
+                    order_number += 1
+                    trade, cash, flow, order_warnings = self._execute_order(
+                        spec,
+                        code,
+                        bar,
+                        PendingOrder(
+                            code=code,
+                            side="BUY",
+                            source="SIGNAL_BUY",
+                            signal_date=day,
+                            execute_date=day,
+                            reason="ENTRY_RULE",
+                            config={
+                                "type": "recurrent_cash",
+                                "amount": buy_cash,
+                                "lot_size": lot_size,
+                                "signal_evidence": signal_evidence,
+                                "cost_basis": "weighted_average",
+                            },
+                            intraday_price=float(bar["close"]),
+                        ),
+                        tactical_book,
+                        cash,
+                        allocation,
+                        lot_size,
+                        next_day,
+                        order_number,
+                    )
+                    trade["book"] = "tactical"
+                    trades.append(trade)
+                    warnings.extend(order_warnings)
+                    if flow:
+                        cash_flows.append(flow)
+                elif plan["action"] == "SELL":
+                    signal_evidence = dict(plan["evidence"])
+                    signal_evidence["book"] = "tactical"
+                    signal_evidence["sell_quantity"] = plan["sell_quantity"]
+                    order_number += 1
+                    trade, cash, flow, order_warnings = self._execute_order(
+                        spec,
+                        code,
+                        bar,
+                        PendingOrder(
+                            code=code,
+                            side="SELL",
+                            source="SELL",
+                            signal_date=day,
+                            execute_date=day,
+                            reason="EXIT_RULE",
+                            config={
+                                "lot_size": lot_size,
+                                "signal_evidence": signal_evidence,
+                                "cost_basis": "weighted_average",
+                            },
+                            requested_quantity=plan["sell_quantity"],
+                            intraday_price=float(bar["close"]),
+                        ),
+                        tactical_book,
+                        cash,
+                        allocation,
+                        lot_size,
+                        next_day,
+                        order_number,
+                    )
+                    trade["book"] = "tactical"
+                    trades.append(trade)
+                    warnings.extend(order_warnings)
+                    if flow:
+                        cash_flows.append(flow)
+                elif plan["exit_count"] > 0:
+                    skipped_sell_signals.append(
+                        {
+                            "signal_date": day,
+                            "exit_count": plan["exit_count"],
+                            "tactical_quantity": tactical_book.total_quantity(),
+                            "reason": "EXIT_WITHOUT_TACTICAL_POSITION",
+                        }
+                    )
+
+            if core_book.quantity_before(day) + tactical_book.quantity_before(day) > 0:
+                dividend = _as_float(bar.get("cash_dividend"))
+                if dividend and dividend > 0:
+                    eligible = core_book.quantity_before(day) + tactical_book.quantity_before(day)
+                    cash += eligible * dividend
+
+            core_value = core_book.market_value(float(bar["close"]))
+            tactical_value = tactical_book.market_value(float(bar["close"]))
+            equity_curve[day] = cash + core_value + tactical_value
+            cash_curve[day] = cash
+            market_value_curve[day] = core_value + tactical_value
+
+        if core_book.total_quantity() > 0 or tactical_book.total_quantity() > 0:
+            warnings.append(
+                "{} positions remain at the end; valued at the final close".format(code)
+            )
+        last_day = dates[-1] if dates else ""
+        last_price = float(bars[-1]["close"]) if bars else 0.0
+        return {
+            "trades": trades,
+            "equity_curve": equity_curve,
+            "cash_curve": cash_curve,
+            "market_value_curve": market_value_curve,
+            "exposure_curve": {
+                day: (market_value_curve[day] / equity if equity else 0.0)
+                for day, equity in equity_curve.items()
+            },
+            "warnings": warnings,
+            "cash_flows": cash_flows,
+            "skipped_sell_signals": skipped_sell_signals,
+            "positions": _layered_position_snapshot(
+                core_book, tactical_book, cash, last_price, last_day
+            ),
         }
 
     def _run_portfolio(self, spec, data, scenario):
@@ -463,6 +753,8 @@ class BacktestEngine:
         pending: List[PendingOrder] = []
         last_close: Dict[str, float] = {}
         equity_curve: Dict[str, float] = {}
+        cash_curve: Dict[str, float] = {}
+        market_value_curve: Dict[str, float] = {}
         trades: List[Dict[str, Any]] = []
         warnings: List[str] = []
         cash_flows: List[Dict[str, Any]] = []
@@ -657,10 +949,13 @@ class BacktestEngine:
                             ),
                         )
 
-            equity_curve[day] = cash + sum(
+            market_value = sum(
                 books[code].market_value(last_close[code])
                 for code in last_close
             )
+            equity_curve[day] = cash + market_value
+            cash_curve[day] = cash
+            market_value_curve[day] = market_value
 
         for code, book in books.items():
             if book.total_quantity() > 0:
@@ -668,6 +963,12 @@ class BacktestEngine:
         return {
             "scenario": scenario,
             "equity_curve": equity_curve,
+            "cash_curve": cash_curve,
+            "market_value_curve": market_value_curve,
+            "exposure_curve": {
+                day: (market_value_curve[day] / equity if equity else 0.0)
+                for day, equity in equity_curve.items()
+            },
             "trades": trades,
             "cash_flows": cash_flows,
             "positions": {code: _position_snapshot(book) for code, book in books.items()},
@@ -678,6 +979,9 @@ class BacktestEngine:
                 trades,
                 cash_flows,
                 {code: _position_snapshot(book) for code, book in books.items()},
+                risk_free_rate_annual=spec.risk_free_rate_annual,
+                cash_curve=cash_curve,
+                market_value_curve=market_value_curve,
             ),
             "warnings": sorted(set(warnings)),
         }
@@ -797,12 +1101,14 @@ class BacktestEngine:
                     ["{} {} 买入资金不足或不足一个交易单位".format(code, day)],
                 )
             gross = target_quantity * fill_price
-            fee = _fee(rates, fill_price, target_quantity, gross)
+            fee_breakdown = _fee_breakdown(rates, fill_price, target_quantity, gross)
+            fee = sum(fee_breakdown.values())
             total = gross + fee
             if total > cash:
                 target_quantity = _affordable_quantity(rates, fill_price, cash, lot_size)
                 gross = target_quantity * fill_price
-                fee = _fee(rates, fill_price, target_quantity, gross)
+                fee_breakdown = _fee_breakdown(rates, fill_price, target_quantity, gross)
+                fee = sum(fee_breakdown.values())
                 total = gross + fee
             if target_quantity <= 0 or total > cash:
                 return (
@@ -856,6 +1162,12 @@ class BacktestEngine:
                 "requested_quantity": requested,
                 "filled_quantity": target_quantity,
                 "fee": round(fee, 8),
+                "commission": round(fee_breakdown["commission"], 8),
+                "stamp_duty": round(fee_breakdown["stamp_duty"], 8),
+                "transfer_fee": round(fee_breakdown["transfer_fee"], 8),
+                "slippage_impact": round(
+                    max(0.0, (fill_price - raw_price) * target_quantity), 8
+                ),
                 "position_before": position_before,
                 "position_after": book.total_quantity(),
                 "available_quantity_before": available_before,
@@ -924,13 +1236,14 @@ class BacktestEngine:
         average_cost_before = book.average_cost()
         actual, allocations = book.sell(target_quantity, day)
         gross = actual * fill_price
-        fee = _fee(rates, fill_price, actual, gross, side="SELL")
+        fee_breakdown = _fee_breakdown(rates, fill_price, actual, gross, side="SELL")
+        fee = sum(fee_breakdown.values())
         revenue = gross - fee
         cash += revenue
         if order_config.get("cost_basis") == "weighted_average" and average_cost_before is not None:
             allocated_cost = average_cost_before * actual
         else:
-            allocated_cost = sum(item[2] for item in allocations)
+            allocated_cost = sum(item["allocated_cost"] for item in allocations)
         clipped = actual < requested
         status = "PARTIAL" if clipped else "FILLED"
         if clipped:
@@ -951,13 +1264,26 @@ class BacktestEngine:
             "requested_quantity": requested,
             "filled_quantity": actual,
             "fee": round(fee, 8),
+            "commission": round(fee_breakdown["commission"], 8),
+            "stamp_duty": round(fee_breakdown["stamp_duty"], 8),
+            "transfer_fee": round(fee_breakdown["transfer_fee"], 8),
+            "slippage_impact": round(
+                max(0.0, (raw_price - fill_price) * actual), 8
+            ),
             "pnl": round(revenue - allocated_cost, 8),
             "position_before": position_before,
             "position_after": book.total_quantity(),
             "available_quantity_before": available_before,
             "cash_before": cash_before,
             "cash_after": round(cash, 8),
-            "lot_ids": [item[0] for item in allocations],
+            "lot_ids": [item["lot_id"] for item in allocations],
+            "allocations": allocations,
+            "holding_days": (
+                sum(item["quantity"] * item["holding_days"] for item in allocations)
+                / actual
+                if actual
+                else None
+            ),
             "status": status,
             "reason": order.reason,
         }
@@ -982,8 +1308,10 @@ class BacktestEngine:
         }
         split = {
             "ratio": ratio,
+            "train_start": dates[0] if train_dates else None,
             "train_end": dates[split_index - 1] if train_dates else None,
             "test_start": dates[split_index] if test_dates else None,
+            "test_end": dates[-1] if test_dates else None,
             "train": {},
             "test": {},
         }
@@ -1138,6 +1466,30 @@ def _position_snapshot(book):
     ]
 
 
+def _layered_book_snapshot(book, price, as_of):
+    average_cost = book.average_cost()
+    return {
+        "quantity": book.total_quantity(),
+        "available_quantity": book.available_quantity(as_of) if as_of else 0,
+        "average_cost": round(average_cost, 8) if average_cost is not None else None,
+        "market_value": round(book.market_value(price), 8),
+        "lots": _position_snapshot(book),
+    }
+
+
+def _layered_position_snapshot(core_book, tactical_book, cash, price, as_of):
+    core = _layered_book_snapshot(core_book, price, as_of)
+    tactical = _layered_book_snapshot(tactical_book, price, as_of)
+    return {
+        "core": core,
+        "tactical": tactical,
+        "total_quantity": core["quantity"] + tactical["quantity"],
+        "core_market_value": core["market_value"],
+        "tactical_market_value": tactical["market_value"],
+        "cash": round(cash, 8),
+    }
+
+
 def _buy_requested_quantity(config, lot_size):
     if str(config.get("type", "all_in")) != "fixed_quantity":
         return None
@@ -1193,6 +1545,13 @@ def _uses_close_execution(spec):
         and execution.get("fill_at") == "close"
         and sizing.get("type") == "recurrent_cash"
         and (spec.entry or {}).get("mode") == "count_conditions"
+    )
+
+
+def _uses_layered_close_execution(spec):
+    sizing = spec.position_sizing or {}
+    return _uses_close_execution(spec) and bool(
+        sizing.get("core") or sizing.get("drawdown_ladder")
     )
 
 
@@ -1252,54 +1611,41 @@ def _metrics(
     trades: List[Dict[str, Any]],
     cash_flows: Optional[List[Dict[str, Any]]] = None,
     positions: Optional[Dict[str, List[Dict[str, Any]]]] = None,
+    risk_free_rate_annual: Optional[float] = None,
+    cash_curve: Optional[Dict[str, float]] = None,
+    market_value_curve: Optional[Dict[str, float]] = None,
 ):
-    final = values[-1] if values else initial
-    peak = initial
-    max_drawdown = 0.0
-    for value in values:
-        peak = max(peak, value)
-        if peak:
-            max_drawdown = max(max_drawdown, (peak - value) / peak)
-    cash_flows = list(cash_flows or [])
-    external = sum(float(flow.get("amount", 0.0)) for flow in cash_flows)
-    flow_by_day = {}
-    for flow in cash_flows:
-        flow_by_day[flow.get("date")] = flow_by_day.get(flow.get("date"), 0.0) + float(
-            flow.get("amount", 0.0)
-        )
-    time_weighted = 1.0
-    previous = initial
-    for day in sorted(equity_curve):
-        base = previous + flow_by_day.get(day, 0.0)
-        current = float(equity_curve[day])
-        if base > 0:
-            time_weighted *= current / base
-        previous = current
-    completed = [
-        trade
-        for trade in trades
-        if trade.get("side") == "SELL" and trade.get("status") != "UNFILLED"
-    ]
-    wins = [trade for trade in completed if trade.get("pnl", 0) > 0]
-    position_metrics = _position_metrics(positions, max(equity_curve) if equity_curve else None)
-    return {
-        "initial_capital": initial,
-        "final_equity": round(final, 8),
-        "external_cash_flow": round(external, 8),
-        "total_contributed": round(initial + external, 8),
-        "net_profit": round(final - initial - external, 8),
-        "cumulative_return": round(final / initial - 1, 8) if not external else None,
-        "time_weighted_return": round(time_weighted - 1, 8),
-        "max_drawdown": round(max_drawdown, 8),
-        "trade_count": len(completed),
-        "win_rate": round(len(wins) / len(completed), 8) if completed else None,
-        **position_metrics,
-    }
+    metrics = calculate_performance_metrics(
+        initial=initial,
+        equity_curve=equity_curve,
+        trades=trades,
+        cash_flows=cash_flows,
+        risk_free_rate_annual=risk_free_rate_annual,
+        cash_curve=cash_curve,
+        market_value_curve=market_value_curve,
+    )
+    position_metrics = _position_metrics(
+        positions, max(equity_curve.keys()) if equity_curve else None
+    )
+    return {**metrics, **position_metrics}
 
 
 def _position_metrics(positions, as_of):
     lots = []
+    layered = {}
     for code, code_lots in (positions or {}).items():
+        if isinstance(code_lots, dict) and (
+            "core" in code_lots or "tactical" in code_lots
+        ):
+            layered[code] = code_lots
+            for book_name in ("core", "tactical"):
+                book = code_lots.get(book_name) or {}
+                for raw_lot in book.get("lots", []) or []:
+                    lot = dict(raw_lot)
+                    lot.setdefault("code", code)
+                    lot.setdefault("book", book_name)
+                    lots.append(lot)
+            continue
         for raw_lot in code_lots or []:
             lot = dict(raw_lot)
             lot.setdefault("code", code)
@@ -1310,11 +1656,42 @@ def _position_metrics(positions, as_of):
         for lot in lots
         if as_of is not None and str(lot.get("available_date", "9999-12-31")) <= str(as_of)
     )
-    return {
+    result = {
         "current_position_lots": lots,
         "current_position_quantity": quantity,
         "current_available_quantity": available,
     }
+    if layered:
+        core_quantity = sum(
+            int((book.get("core") or {}).get("quantity", 0))
+            for book in layered.values()
+        )
+        tactical_quantity = sum(
+            int((book.get("tactical") or {}).get("quantity", 0))
+            for book in layered.values()
+        )
+        result.update(
+            {
+                "core_position_quantity": core_quantity,
+                "tactical_position_quantity": tactical_quantity,
+                "core_market_value": round(
+                    sum(float(book.get("core_market_value", 0.0)) for book in layered.values()),
+                    8,
+                ),
+                "tactical_market_value": round(
+                    sum(
+                        float(book.get("tactical_market_value", 0.0))
+                        for book in layered.values()
+                    ),
+                    8,
+                ),
+                "layered_cash": round(
+                    sum(float(book.get("cash", 0.0)) for book in layered.values()),
+                    8,
+                ),
+            }
+        )
+    return result
 
 
 def _metrics_from_data(engine, spec, data, scenario):
@@ -1362,7 +1739,7 @@ def _price_value(bar, field):
 def _provenance(spec, data, actions):
     dates = [str(bar["date"]) for bars in data.values() for bar in bars]
     policy = spec.data_policy
-    return {
+    provenance = {
         "source_name": policy.get("source_name", "a-stock-data"),
         "source_url": policy.get("source_url"),
         "source_version": policy.get("source_version", "a-stock-data:unknown"),
@@ -1376,6 +1753,13 @@ def _provenance(spec, data, actions):
         "corporate_actions": actions,
         "cost_profile": _cost_profile(spec, include_defaults=True),
     }
+    sizing = spec.position_sizing or {}
+    if sizing.get("core") or sizing.get("drawdown_ladder"):
+        provenance["layered"] = {
+            "core": dict(sizing.get("core") or {}),
+            "drawdown_ladder": dict(sizing.get("drawdown_ladder") or {}),
+        }
+    return provenance
 
 
 def _cost_profile(spec, include_defaults=False):
@@ -1392,13 +1776,21 @@ def _cost_profile(spec, include_defaults=False):
 
 
 def _fee(rates, price, quantity, gross, side="BUY"):
+    return sum(_fee_breakdown(rates, price, quantity, gross, side).values())
+
+
+def _fee_breakdown(rates, price, quantity, gross, side="BUY"):
     commission = max(
         gross * float(rates.get("commission_rate", 0.0)),
         float(rates.get("minimum_commission", 0.0)) if gross > 0 else 0.0,
     )
     transfer = gross * float(rates.get("transfer_fee_rate", 0.0))
     stamp = gross * float(rates.get("stamp_duty_rate", 0.0)) if side == "SELL" else 0.0
-    return commission + transfer + stamp
+    return {
+        "commission": commission,
+        "stamp_duty": stamp,
+        "transfer_fee": transfer,
+    }
 
 
 def _unfilled_trade(

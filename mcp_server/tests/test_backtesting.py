@@ -56,6 +56,26 @@ def test_signal_at_close_executes_at_next_trading_day_open():
     assert trade["price"] == 20
 
 
+def test_backtest_result_contains_report_metrics_and_daily_portfolio_curves():
+    spec = _strategy()
+    bars = [
+        {"date": "2026-01-01", "open": 10, "high": 10, "low": 10, "close": 10},
+        {"date": "2026-01-02", "open": 10, "high": 10, "low": 10, "close": 10},
+        {"date": "2026-01-03", "open": 10, "high": 10, "low": 10, "close": 10},
+        {"date": "2026-01-04", "open": 20, "high": 21, "low": 19, "close": 20},
+        {"date": "2026-01-05", "open": 20, "high": 20, "low": 18, "close": 18},
+    ]
+
+    scenario = BacktestEngine().run(spec, {"600000": bars})["scenarios"]["default"]
+
+    assert scenario["metrics"]["annualized_return"] is not None
+    assert "annualized_volatility" in scenario["metrics"]
+    assert "profit_factor" in scenario["metrics"]
+    assert set(scenario["cash_curve"]) == set(scenario["equity_curve"])
+    assert set(scenario["market_value_curve"]) == set(scenario["equity_curve"])
+    assert set(scenario["exposure_curve"]) == set(scenario["equity_curve"])
+
+
 def test_stop_and_take_same_day_produce_two_scenarios_and_provenance():
     spec = _strategy(
         stop_loss_pct=0.05,

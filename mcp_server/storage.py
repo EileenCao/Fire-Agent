@@ -99,6 +99,10 @@ class SQLiteStore:
                     spec_json TEXT NOT NULL,
                     content_hash TEXT NOT NULL,
                     is_active INTEGER NOT NULL DEFAULT 0,
+                    parent_version TEXT,
+                    source_run_id INTEGER,
+                    change_set_json TEXT,
+                    approval_diff_hash TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     UNIQUE(strategy_id, version)
@@ -111,7 +115,20 @@ class SQLiteStore:
                     status TEXT NOT NULL,
                     source_version TEXT,
                     result_json TEXT NOT NULL,
+                    artifact_dir TEXT,
+                    analysis_status TEXT NOT NULL DEFAULT 'pending',
                     created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS backtest_analyses (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id INTEGER NOT NULL,
+                    version INTEGER NOT NULL,
+                    context_hash TEXT NOT NULL,
+                    analysis_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(run_id, version),
+                    FOREIGN KEY(run_id) REFERENCES backtest_runs(id)
                 );
 
                 CREATE TABLE IF NOT EXISTS signal_evidence (
@@ -133,9 +150,26 @@ class SQLiteStore:
             _ensure_column(connection, "delivery_attempts", "chunk_index", "INTEGER NOT NULL DEFAULT 0")
             _ensure_column(connection, "delivery_attempts", "chunk_count", "INTEGER NOT NULL DEFAULT 1")
             _ensure_column(connection, "delivery_attempts", "content_format", "TEXT NOT NULL DEFAULT 'text'")
+            _ensure_column(connection, "strategy_versions", "parent_version", "TEXT")
+            _ensure_column(connection, "strategy_versions", "source_run_id", "INTEGER")
+            _ensure_column(connection, "strategy_versions", "change_set_json", "TEXT")
+            _ensure_column(connection, "strategy_versions", "approval_diff_hash", "TEXT")
+            _ensure_column(connection, "backtest_runs", "artifact_dir", "TEXT")
+            _ensure_column(
+                connection,
+                "backtest_runs",
+                "analysis_status",
+                "TEXT NOT NULL DEFAULT 'pending'",
+            )
 
     def save_strategy_version(
-        self, spec: StrategySpec, status: str = "draft"
+        self,
+        spec: StrategySpec,
+        status: str = "draft",
+        parent_version: Optional[str] = None,
+        source_run_id: Optional[int] = None,
+        change_set: Optional[List[Dict[str, Any]]] = None,
+        approval_diff_hash: Optional[str] = None,
     ) -> Dict[str, Any]:
         if status not in {"draft", "approved", "active", "archived"}:
             raise ValueError("策略状态必须是 draft、approved、active 或 archived")
@@ -145,18 +179,25 @@ class SQLiteStore:
         content_hash = hashlib.sha256(payload.encode("utf-8")).hexdigest()
         timestamp = _utc_now()
         with self._connect() as connection:
+            existing = connection.execute(
+                "SELECT * FROM strategy_versions WHERE strategy_id = ? AND version = ?",
+                (spec.strategy_id, spec.version),
+            ).fetchone()
+            if existing is not None:
+                if existing["content_hash"] != content_hash:
+                    raise ValueError(
+                        "策略版本不可覆盖：{}@{} 已存在不同内容".format(
+                            spec.strategy_id, spec.version
+                        )
+                    )
+                return dict(existing)
             connection.execute(
                 """
                 INSERT INTO strategy_versions
                     (strategy_id, version, name, status, spec_json, content_hash,
-                     is_active, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)
-                ON CONFLICT(strategy_id, version) DO UPDATE SET
-                    name = excluded.name,
-                    status = excluded.status,
-                    spec_json = excluded.spec_json,
-                    content_hash = excluded.content_hash,
-                    updated_at = excluded.updated_at
+                     is_active, parent_version, source_run_id, change_set_json,
+                     approval_diff_hash, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     spec.strategy_id,
@@ -165,6 +206,12 @@ class SQLiteStore:
                     status,
                     payload,
                     content_hash,
+                    parent_version,
+                    source_run_id,
+                    json.dumps(change_set, ensure_ascii=False, sort_keys=True)
+                    if change_set is not None
+                    else None,
+                    approval_diff_hash,
                     timestamp,
                     timestamp,
                 ),
@@ -177,6 +224,22 @@ class SQLiteStore:
                 (spec.strategy_id, spec.version),
             ).fetchone()
         return dict(row)
+
+    def get_strategy_version(
+        self, strategy_id: str, version: str
+    ) -> Optional[Dict[str, Any]]:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM strategy_versions WHERE strategy_id = ? AND version = ?",
+                (strategy_id, version),
+            ).fetchone()
+        if row is None:
+            return None
+        value = dict(row)
+        value["strategy"] = json.loads(value.pop("spec_json"))
+        if value.get("change_set_json"):
+            value["change_set"] = json.loads(value.pop("change_set_json"))
+        return value
 
     def activate_strategy(self, strategy_id: str, version: str) -> None:
         with self._connect() as connection:
@@ -232,8 +295,9 @@ class SQLiteStore:
             cursor = connection.execute(
                 """
                 INSERT INTO backtest_runs
-                    (strategy_id, strategy_version, status, source_version, result_json, created_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                    (strategy_id, strategy_version, status, source_version, result_json,
+                     artifact_dir, analysis_status, created_at)
+                VALUES (?, ?, ?, ?, ?, NULL, 'pending', ?)
                 """,
                 (
                     spec.strategy_id,
@@ -279,6 +343,79 @@ class SQLiteStore:
                 "SELECT * FROM backtest_runs WHERE id = ?", (run_id,)
             ).fetchone()
         return dict(row)
+
+    def update_backtest_artifacts(
+        self, run_id: int, artifact_dir: str, analysis_status: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
+        if analysis_status is not None and analysis_status not in {
+            "pending",
+            "saved",
+        }:
+            raise ValueError("analysis_status 只能是 pending 或 saved")
+        with self._connect() as connection:
+            if analysis_status is None:
+                connection.execute(
+                    "UPDATE backtest_runs SET artifact_dir = ? WHERE id = ?",
+                    (str(artifact_dir), int(run_id)),
+                )
+            else:
+                connection.execute(
+                    """
+                    UPDATE backtest_runs
+                    SET artifact_dir = ?, analysis_status = ?
+                    WHERE id = ?
+                    """,
+                    (str(artifact_dir), analysis_status, int(run_id)),
+                )
+            row = connection.execute(
+                "SELECT * FROM backtest_runs WHERE id = ?", (int(run_id),)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def save_backtest_analysis(
+        self, run_id: int, context_hash: str, analysis: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        timestamp = _utc_now()
+        payload = json.dumps(analysis, ensure_ascii=False, sort_keys=True)
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT id, version FROM backtest_analyses WHERE run_id = ? "
+                "ORDER BY version DESC LIMIT 1",
+                (int(run_id),),
+            ).fetchone()
+            version = int(row["version"]) + 1 if row else 1
+            connection.execute(
+                """
+                INSERT INTO backtest_analyses
+                    (run_id, version, context_hash, analysis_json, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (int(run_id), version, context_hash, payload, timestamp),
+            )
+            connection.execute(
+                "UPDATE backtest_runs SET analysis_status = 'saved' WHERE id = ?",
+                (int(run_id),),
+            )
+            saved = connection.execute(
+                "SELECT * FROM backtest_analyses WHERE run_id = ? AND version = ?",
+                (int(run_id), version),
+            ).fetchone()
+        value = dict(saved)
+        value["analysis"] = json.loads(value.pop("analysis_json"))
+        return value
+
+    def get_latest_backtest_analysis(self, run_id: int) -> Optional[Dict[str, Any]]:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM backtest_analyses WHERE run_id = ? "
+                "ORDER BY version DESC LIMIT 1",
+                (int(run_id),),
+            ).fetchone()
+        if row is None:
+            return None
+        value = dict(row)
+        value["analysis"] = json.loads(value.pop("analysis_json"))
+        return value
 
     def get_backtest_result(self, run_id: int) -> Optional[Dict[str, Any]]:
         with self._connect() as connection:

@@ -12,6 +12,8 @@ def _strategy():
         "entry": {"rules": [{"type": "state", "left": "close", "right": 1}]},
         "exit": {"rules": []},
         "position_sizing": {"type": "all_in"},
+        "benchmark": None,
+        "risk_free_rate_annual": 0.0,
         "cost_profile": {"template": "realistic", "version": "1.0.0"},
         "data_policy": {"source_name": "fixture", "source_version": "a-stock-data:3.6.0"},
     }
@@ -43,6 +45,8 @@ def test_formal_backtest_requires_explicit_cost_and_sizing_confirmation(tmp_path
             "run_mode": "formal",
             "confirm_cost_profile": True,
             "confirm_position_sizing": True,
+            "confirm_benchmark": True,
+            "confirm_risk_free_rate": True,
         },
     )
 

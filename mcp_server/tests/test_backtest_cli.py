@@ -19,6 +19,8 @@ def _write_inputs(tmp_path):
         "entry": {"rules": [{"type": "cross_above", "left": "sma_2", "right": "sma_3"}]},
         "exit": {"rules": [{"type": "cross_below", "left": "sma_2", "right": "sma_3"}]},
         "position_sizing": {"type": "all_in"},
+        "benchmark": None,
+        "risk_free_rate_annual": 0.0,
         "data_policy": {"source_name": "fixture", "source_version": "a-stock-data:3.6.0"},
     }
     data = {"512890": [
@@ -68,13 +70,17 @@ def test_cli_runs_backtest_and_writes_local_artifacts(tmp_path, monkeypatch, cap
         str(data_path),
         "--output-dir",
         str(output_dir),
+        "--confirm-benchmark",
+        "--confirm-risk-free-rate",
     ]) == 0
 
     result = json.loads(capsys.readouterr().out)
     assert result["run_id"] > 0
-    assert (output_dir / "result.json").exists()
-    assert (output_dir / "report.md").exists()
-    assert (output_dir / "trades.csv").exists()
+    artifact_dir = __import__("pathlib").Path(result["artifacts"]["artifact_dir"])
+    assert artifact_dir.parent == output_dir
+    assert (artifact_dir / "result.json").exists()
+    assert (artifact_dir / "report.md").exists()
+    assert (artifact_dir / "trades.csv").exists()
 
 
 def test_cli_uses_default_strategy_path_when_strategy_is_omitted(tmp_path, monkeypatch, capsys):
@@ -94,6 +100,8 @@ def test_cli_uses_default_strategy_path_when_strategy_is_omitted(tmp_path, monke
         str(data_path),
         "--output-dir",
         str(output_dir),
+        "--confirm-benchmark",
+        "--confirm-risk-free-rate",
     ]) == 0
 
     result = json.loads(capsys.readouterr().out)
@@ -114,14 +122,18 @@ def test_cli_uses_latest_artifacts_path_when_output_dir_is_omitted(tmp_path, mon
         str(strategy_path),
         "--data",
         str(data_path),
+        "--confirm-benchmark",
+        "--confirm-risk-free-rate",
     ]) == 0
 
     result = json.loads(capsys.readouterr().out)
     assert result["run_id"] > 0
     output_dir = workspace_path / "artifacts" / "latest"
-    assert (output_dir / "result.json").exists()
-    assert (output_dir / "report.md").exists()
-    assert (output_dir / "trades.csv").exists()
+    artifact_dir = __import__("pathlib").Path(result["artifacts"]["artifact_dir"])
+    assert artifact_dir.parent == output_dir
+    assert (artifact_dir / "result.json").exists()
+    assert (artifact_dir / "report.md").exists()
+    assert (artifact_dir / "trades.csv").exists()
 
 
 def test_cli_fetches_data_automatically_into_the_user_workspace(
@@ -163,8 +175,10 @@ def test_cli_fetches_data_automatically_into_the_user_workspace(
 
     monkeypatch.setattr("mcp_server.cli.build_historical_data_provider", lambda root: FakeProvider())
 
-    assert main(["run-backtest"]) == 0
+    assert main(["run-backtest", "--confirm-benchmark", "--confirm-risk-free-rate"]) == 0
 
     result = json.loads(capsys.readouterr().out)
     assert result["result"]["provenance"]["source_name"] == "fake-a-stock-data"
-    assert (workspace_path / "artifacts" / "latest" / "result.json").exists()
+    artifact_dir = __import__("pathlib").Path(result["artifacts"]["artifact_dir"])
+    assert artifact_dir.parent == workspace_path / "artifacts" / "latest"
+    assert (artifact_dir / "result.json").exists()

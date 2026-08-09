@@ -4,6 +4,7 @@ from typing import Any, Dict, Optional
 
 from mcp_server.services.backtesting import _normalize_data, _rules_match
 from mcp_server.services.indicators import build_indicator_series
+from mcp_server.services.layered_sizing import build_ladder_state, resolve_tactical_cash
 from mcp_server.services.signal_planner import build_signal_plan
 
 
@@ -42,7 +43,14 @@ class StrategyObserver:
             latest = bars[-1]
             closes = [float(bar["close"]) for bar in bars]
             index = len(bars) - 1
-            position_quantity = _position_quantity(positions.get(code))
+            position_details = _position_details(positions.get(code))
+            position_quantity = position_details["total_quantity"]
+            layered = bool(
+                (spec.position_sizing or {}).get("core")
+                or (spec.position_sizing or {}).get("drawdown_ladder")
+            )
+            ladder_state = None
+            signal_evidence = None
             base_evidence = {
                 "signal_date": str(latest["date"]),
                 "data_as_of": str(latest["date"]),
@@ -61,7 +69,11 @@ class StrategyObserver:
                     spec,
                     bars,
                     index,
-                    int(position_quantity),
+                    int(
+                        position_details["tactical_quantity"]
+                        if layered
+                        else position_quantity
+                    ),
                     indicator_series=indicator_series,
                 )
                 action = plan["action"]
@@ -71,6 +83,35 @@ class StrategyObserver:
                 evidence.update(plan["evidence"])
                 evidence["buy_cash"] = plan["buy_cash"]
                 evidence["sell_quantity"] = plan["sell_quantity"]
+                if layered:
+                    if (spec.position_sizing or {}).get("drawdown_ladder"):
+                        ladder_state = build_ladder_state(spec, bars, index)
+                    evidence.update(
+                        {
+                            "core_quantity": position_details["core_quantity"],
+                            "tactical_quantity": position_details["tactical_quantity"],
+                            "ladder_state": ladder_state,
+                        }
+                    )
+                    signal_evidence = dict(evidence)
+                    signal_evidence["book"] = "tactical"
+                    signal_evidence["buy_cash"] = (
+                        resolve_tactical_cash(
+                            plan["buy_cash"], ladder_state["ladder_amount"]
+                        )
+                        if ladder_state is not None and action == "BUY"
+                        else plan["buy_cash"]
+                    )
+                    signal_evidence["ladder"] = (
+                        {
+                            "state": ladder_state,
+                            "ladder_amount": ladder_state["ladder_amount"],
+                        }
+                        if ladder_state is not None
+                        else None
+                    )
+                    if action == "SELL":
+                        signal_evidence["sell_quantity"] = plan["sell_quantity"]
                 execution = (
                     "same_trading_day_close" if action in {"BUY", "SELL"} else None
                 )
@@ -93,15 +134,23 @@ class StrategyObserver:
                     }
                 )
                 execution = "next_trading_day_open" if action in {"BUY", "SELL"} else None
-            signals.append(
-                {
-                    "code": code,
-                    "action": action,
-                    "execution": execution,
-                    "status": "ok" if not warnings else "partial",
-                    "evidence": evidence,
-                }
-            )
+            signal = {
+                "code": code,
+                "action": action,
+                "execution": execution,
+                "status": "ok" if not warnings else "partial",
+                "evidence": evidence,
+            }
+            if layered:
+                signal.update(
+                    {
+                        "core_quantity": position_details["core_quantity"],
+                        "tactical_quantity": position_details["tactical_quantity"],
+                        "ladder_state": ladder_state,
+                        "signal_evidence": signal_evidence or evidence,
+                    }
+                )
+            signals.append(signal)
         return {
             "strategy_id": spec.strategy_id,
             "strategy_version": spec.version,
@@ -115,9 +164,37 @@ class StrategyObserver:
 
 
 def _position_quantity(value):
-    if isinstance(value, dict):
-        value = value.get("quantity", 0)
+    return _position_details(value)["total_quantity"]
+
+
+def _position_details(value):
+    if isinstance(value, dict) and ("core" in value or "tactical" in value):
+        core_quantity = _book_quantity(value.get("core"))
+        tactical_quantity = _book_quantity(value.get("tactical"))
+        return {
+            "core_quantity": core_quantity,
+            "tactical_quantity": tactical_quantity,
+            "total_quantity": core_quantity + tactical_quantity,
+        }
+    quantity = value.get("quantity", 0) if isinstance(value, dict) else value
     try:
-        return float(value or 0)
+        total = float(quantity or 0)
+    except (TypeError, ValueError):
+        total = 0.0
+    return {"core_quantity": 0.0, "tactical_quantity": total, "total_quantity": total}
+
+
+def _book_quantity(value):
+    if not isinstance(value, dict):
+        return 0.0
+    quantity = value.get("quantity")
+    if quantity is None:
+        quantity = sum(
+            float(lot.get("quantity", 0) or 0)
+            for lot in value.get("lots", [])
+            if isinstance(lot, dict)
+        )
+    try:
+        return float(quantity or 0)
     except (TypeError, ValueError):
         return 0.0

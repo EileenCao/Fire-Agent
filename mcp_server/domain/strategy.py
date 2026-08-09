@@ -30,7 +30,8 @@ class StrategySpec:
     exit: Dict[str, Any]
     position_sizing: Optional[Dict[str, Any]]
     initial_capital: float = 100000.0
-    benchmark: Optional[str] = "000300"
+    benchmark: Optional[Dict[str, Any]] = None
+    risk_free_rate_annual: Optional[float] = None
     cost_profile: Dict[str, Any] = field(default_factory=dict)
     stop_loss_pct: Optional[float] = None
     take_profit_pct: Optional[float] = None
@@ -80,6 +81,23 @@ class StrategySpec:
         except (TypeError, ValueError):
             errors.append("初始资金必须是数字")
             initial_capital = 100000.0
+        risk_free_rate_annual = payload.get("risk_free_rate_annual")
+        if risk_free_rate_annual is not None:
+            try:
+                risk_free_rate_annual = float(risk_free_rate_annual)
+                if risk_free_rate_annual <= -1 or risk_free_rate_annual > 1:
+                    errors.append("risk_free_rate_annual 必须大于 -1 且不超过 1")
+            except (TypeError, ValueError):
+                errors.append("risk_free_rate_annual 必须是数字")
+                risk_free_rate_annual = None
+        benchmark = payload.get("benchmark")
+        if benchmark is not None and not isinstance(benchmark, dict):
+            errors.append("benchmark 必须是对象或 null")
+            benchmark = None
+        elif isinstance(benchmark, dict):
+            for field_name in ("code", "market", "instrument_type", "name"):
+                if not benchmark.get(field_name):
+                    errors.append("benchmark 缺少字段：{}".format(field_name))
         for field_name in ("stop_loss_pct", "take_profit_pct"):
             value = payload.get(field_name)
             if value is not None:
@@ -111,7 +129,8 @@ class StrategySpec:
             exit=dict(payload.get("exit") or {}),
             position_sizing=dict(position_sizing) if position_sizing else None,
             initial_capital=initial_capital,
-            benchmark=payload.get("benchmark", "000300"),
+            benchmark=dict(benchmark) if benchmark else None,
+            risk_free_rate_annual=risk_free_rate_annual,
             cost_profile=dict(payload.get("cost_profile") or {}),
             stop_loss_pct=payload.get("stop_loss_pct"),
             take_profit_pct=payload.get("take_profit_pct"),
@@ -139,7 +158,8 @@ class StrategySpec:
             "exit": dict(self.exit),
             "position_sizing": dict(self.position_sizing) if self.position_sizing else None,
             "initial_capital": self.initial_capital,
-            "benchmark": self.benchmark,
+            "benchmark": dict(self.benchmark) if self.benchmark else None,
+            "risk_free_rate_annual": self.risk_free_rate_annual,
             "cost_profile": dict(self.cost_profile),
             "stop_loss_pct": self.stop_loss_pct,
             "take_profit_pct": self.take_profit_pct,
@@ -170,6 +190,41 @@ def _normalize_action_priority(value):
     return normalized or ["SELL", "SIGNAL_BUY"], errors
 
 
+def validate_run_assumptions(
+    payload: Dict[str, Any],
+    confirm_benchmark: bool,
+    confirm_risk_free_rate: bool,
+) -> List[str]:
+    """Validate assumptions that must be explicitly confirmed before a run."""
+    errors = []
+    if "benchmark" not in payload:
+        errors.append("策略必须显式选择 benchmark（对象或 null）")
+    elif payload.get("benchmark") is not None:
+        benchmark = payload.get("benchmark")
+        if not isinstance(benchmark, dict):
+            errors.append("benchmark 必须是对象或 null")
+        else:
+            for field_name in ("code", "market", "instrument_type", "name"):
+                if not benchmark.get(field_name):
+                    errors.append("benchmark 缺少字段：{}".format(field_name))
+    if "risk_free_rate_annual" not in payload:
+        errors.append("策略必须显式设置 risk_free_rate_annual")
+    elif payload.get("risk_free_rate_annual") is None:
+        errors.append("risk_free_rate_annual 不能为 null")
+    else:
+        try:
+            value = float(payload.get("risk_free_rate_annual"))
+            if value <= -1 or value > 1:
+                errors.append("risk_free_rate_annual 必须大于 -1 且不超过 1")
+        except (TypeError, ValueError):
+            errors.append("risk_free_rate_annual 必须是数字")
+    if not confirm_benchmark:
+        errors.append("回测前必须确认 benchmark 选择")
+    if not confirm_risk_free_rate:
+        errors.append("回测前必须确认年化无风险利率")
+    return errors
+
+
 def _validate_position_sizing(sizing):
     if not sizing:
         return []
@@ -192,6 +247,7 @@ def _validate_position_sizing(sizing):
         initial_quantity = sizing.get("initial_quantity", 0)
         if _nonnegative_int(initial_quantity) is None:
             errors.append("recurrent_cash initial_quantity 必须是非负整数")
+    errors.extend(_validate_layered_sizing(sizing))
     if kind in {"cash_pct", "fixed_fraction"}:
         fraction = sizing.get("fraction", sizing.get("amount"))
         if _positive_number(fraction) is None or float(fraction) > 1:
@@ -205,6 +261,72 @@ def _validate_position_sizing(sizing):
         if config is None or not isinstance(config, dict) or not config.get("enabled", True):
             continue
         errors.extend(_validate_buy_plan(config, key, lot_size))
+    return errors
+
+
+def _validate_layered_sizing(sizing):
+    errors = []
+    core = sizing.get("core")
+    if core is not None:
+        if not isinstance(core, dict):
+            errors.append("core 必须是对象")
+        else:
+            ratio = _number(core.get("ratio"))
+            if ratio is None or ratio <= 0 or ratio >= 1:
+                errors.append("core ratio 必须大于 0 且小于 1")
+            if core.get("trigger", "first_entry_signal") != "first_entry_signal":
+                errors.append("core trigger 必须是 first_entry_signal")
+            if core.get("hold", True) is not True:
+                errors.append("core hold 必须为 true")
+
+    ladder = sizing.get("drawdown_ladder")
+    if ladder is None:
+        return errors
+    if not isinstance(ladder, dict):
+        return errors + ["drawdown_ladder 必须是对象"]
+
+    thresholds = ladder.get("thresholds")
+    amounts = ladder.get("amounts")
+    if not isinstance(thresholds, list) or not thresholds:
+        errors.append("drawdown_ladder thresholds 必须是非空数组")
+        thresholds = []
+    if not isinstance(amounts, list) or not amounts:
+        errors.append("drawdown_ladder amounts 必须是非空数组")
+        amounts = []
+    if thresholds and amounts and len(thresholds) != len(amounts):
+        errors.append("drawdown_ladder thresholds 和 amounts 长度必须一致")
+    previous = 0.0
+    for value in thresholds:
+        number = _number(value)
+        if number is None or number <= 0 or number >= 1 or number <= previous:
+            errors.append("drawdown_ladder thresholds 必须为递增的 0 到 1 之间数值")
+            break
+        previous = number
+    for value in amounts:
+        if _positive_number(value) is None:
+            errors.append("drawdown_ladder amounts 必须为正数")
+            break
+
+    anchor_window = _positive_int(ladder.get("anchor_window", 120))
+    annual_period = _positive_int(ladder.get("annual_period", 250))
+    if anchor_window is None:
+        errors.append("drawdown_ladder anchor_window 必须是正整数")
+    if annual_period is None:
+        errors.append("drawdown_ladder annual_period 必须是正整数")
+    max_level = _positive_int(ladder.get("max_level", len(thresholds)))
+    if max_level is None or (thresholds and max_level != len(thresholds)):
+        errors.append("drawdown_ladder max_level 必须等于档位数量")
+    if ladder.get("combine", "max") != "max":
+        errors.append("drawdown_ladder combine 必须是 max")
+    if ladder.get("requires_rsi_entry", True) is not True:
+        errors.append("drawdown_ladder requires_rsi_entry 必须为 true")
+    if ladder.get("reset", "new_anchor_high") != "new_anchor_high":
+        errors.append("drawdown_ladder reset 必须是 new_anchor_high")
+    for key in ("annual_boost_threshold", "annual_deep_threshold"):
+        default = 0.0 if key == "annual_boost_threshold" else 0.05
+        value = _number(ladder.get(key, default))
+        if value is None or value < 0 or value >= 1:
+            errors.append("drawdown_ladder {} 必须是 0 到 1 之间数值".format(key))
     return errors
 
 

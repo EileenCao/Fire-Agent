@@ -4,11 +4,12 @@ import json
 import sys
 from dataclasses import asdict
 from datetime import time
+from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
 
 from mcp_server.calendar import TradingCalendar
 from mcp_server.dependencies import AStockDataSkillError, require_a_stock_data_skill
-from mcp_server.domain.strategy import StrategySpec
+from mcp_server.domain.strategy import StrategySpec, validate_run_assumptions
 from mcp_server.runtime import (
     build_calendar,
     build_historical_data_provider,
@@ -17,6 +18,11 @@ from mcp_server.runtime import (
     build_store,
 )
 from mcp_server.services.backtesting import BacktestEngine
+from mcp_server.services.artifacts import write_backtest_artifacts
+from mcp_server.services.backtest_pipeline import (
+    benchmark_provider_code,
+    enrich_backtest_result,
+)
 from mcp_server.services.observer import StrategyObserver
 from mcp_server.services.data_cache import ParquetDataCache
 from mcp_server.services.historical_data import (
@@ -25,6 +31,7 @@ from mcp_server.services.historical_data import (
     resolve_strategy_window,
 )
 from mcp_server.services.runner import DailyReportRunner
+from mcp_server.workspace import load_workspace
 
 
 def tool_definitions() -> list:
@@ -39,6 +46,11 @@ def tool_definitions() -> list:
             "properties": {
                 "strategy": {"type": "object"},
                 "status": {"type": "string", "enum": ["draft", "approved"]},
+                "parent_version": {"type": "string"},
+                "source_run_id": {"type": "integer"},
+                "change_set": {"type": "array"},
+                "approved_diff_hash": {"type": "string"},
+                "user_confirmed": {"type": "boolean"},
             },
             "required": ["strategy"],
         }),
@@ -69,6 +81,30 @@ def tool_definitions() -> list:
         _tool("get_backtest_result", "读取已保存的回测结果", {
             "type": "object", "properties": {"run_id": {"type": "integer"}},
             "required": ["run_id"],
+        }),
+        _tool("get_backtest_report_context", "获取有大小限制的回测报告上下文", {
+            "type": "object", "properties": {"run_id": {"type": "integer"}},
+            "required": ["run_id"],
+        }),
+        _tool("save_backtest_analysis", "保存带证据引用的 AI 分析", {
+            "type": "object",
+            "properties": {
+                "run_id": {"type": "integer"},
+                "context_hash": {"type": "string"},
+                "analysis": {"type": "object"},
+            },
+            "required": ["run_id", "context_hash", "analysis"],
+        }),
+        _tool("prepare_strategy_revision", "生成待用户最终审批的策略 diff", {
+            "type": "object",
+            "properties": {
+                "base_strategy": {"type": "object"},
+                "strategy": {"type": "object"},
+                "proposed_strategy": {"type": "object"},
+                "source_run_id": {"type": "integer"},
+                "change_details": {"type": "object"},
+            },
+            "required": ["strategy"],
         }),
         _tool("compare_backtests", "比较多个回测结果的核心指标", {
             "type": "object", "properties": {"run_ids": {"type": "array"}},
@@ -133,6 +169,8 @@ def tool_definitions() -> list:
                     "run_mode": {"type": "string", "enum": ["exploratory", "formal"]},
                     "confirm_cost_profile": {"type": "boolean"},
                     "confirm_position_sizing": {"type": "boolean"},
+                    "confirm_benchmark": {"type": "boolean"},
+                    "confirm_risk_free_rate": {"type": "boolean"},
                 }
             )
         if tool["name"] == "observe_active_strategy":
@@ -152,6 +190,7 @@ class McpApplication:
         backtest_engine: Optional[BacktestEngine] = None,
         require_data_skill: bool = False,
         historical_data_provider=None,
+        artifact_root=None,
     ):
         self.store = store
         self.market_provider = market_provider
@@ -160,6 +199,11 @@ class McpApplication:
         self.backtest_engine = backtest_engine or BacktestEngine()
         self.require_data_skill = require_data_skill
         self.historical_data_provider = historical_data_provider
+        self.artifact_root = (
+            Path(artifact_root)
+            if artifact_root is not None
+            else Path(store.path).parent / "artifacts"
+        )
 
     def call_tool(self, name: str, arguments: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         args = arguments or {}
@@ -208,7 +252,42 @@ class McpApplication:
     def _save_strategy_version(self, args):
         spec = StrategySpec.from_dict(args.get("strategy") or {})
         status = args.get("status", "draft")
-        record = self.store.save_strategy_version(spec, status=status)
+        revision_fields = {
+            "parent_version",
+            "source_run_id",
+            "change_set",
+            "approved_diff_hash",
+        }
+        is_revision = any(args.get(field) is not None for field in revision_fields)
+        if is_revision:
+            if not args.get("user_confirmed"):
+                raise ValueError("保存策略修订前必须获得用户对完整 diff 的最终批准")
+            required = ("parent_version", "change_set", "approved_diff_hash")
+            missing = [field for field in required if args.get(field) in (None, "")]
+            if missing:
+                raise ValueError("策略修订缺少批准字段：{}".format(", ".join(missing)))
+            from mcp_server.services.strategy_revision import verify_approved_revision
+
+            verify_approved_revision(
+                self.store,
+                spec,
+                args["parent_version"],
+                args["change_set"],
+                args["approved_diff_hash"],
+                source_run_id=args.get("source_run_id"),
+            )
+            if args.get("source_run_id") is not None and self.store.get_backtest_result(
+                int(args["source_run_id"])
+            ) is None:
+                raise ValueError("找不到来源回测运行：{}".format(args["source_run_id"]))
+        record = self.store.save_strategy_version(
+            spec,
+            status=status,
+            parent_version=args.get("parent_version"),
+            source_run_id=args.get("source_run_id"),
+            change_set=args.get("change_set"),
+            approval_diff_hash=args.get("approved_diff_hash"),
+        )
         return {
             "strategy": spec.to_dict(),
             "record": {
@@ -233,6 +312,13 @@ class McpApplication:
             policy.setdefault("source_name", "a-stock-data")
             policy.setdefault("source_version", "a-stock-data:{}".format(skill.version))
             payload["data_policy"] = policy
+        assumption_errors = validate_run_assumptions(
+            payload,
+            confirm_benchmark=bool(args.get("confirm_benchmark")),
+            confirm_risk_free_rate=bool(args.get("confirm_risk_free_rate")),
+        )
+        if assumption_errors:
+            raise ValueError("；".join(assumption_errors))
         spec = StrategySpec.from_dict(payload)
         if not spec.is_valid:
             raise ValueError("策略不可运行：{}".format("；".join(spec.validation_errors)))
@@ -317,18 +403,98 @@ class McpApplication:
             if not spec.cost_profile.get("template") or not spec.cost_profile.get("version"):
                 raise ValueError("正式回测必须提供带版本的成本模板")
         spec, data, fetched = self._resolve_backtest_inputs(args)
+        benchmark_data, benchmark_fetched = self._resolve_benchmark_inputs(spec, args)
         result = self.backtest_engine.run(spec, data)
         if fetched is not None:
             result["provenance"].update(fetched.provenance)
         result["run_mode"] = run_mode
+        enrich_backtest_result(
+            result,
+            spec,
+            benchmark_data=benchmark_data,
+            benchmark_provenance=(
+                benchmark_fetched.provenance if benchmark_fetched else None
+            ),
+            benchmark_errors=(benchmark_fetched.errors if benchmark_fetched else None),
+        )
         record = self.store.save_backtest_run(spec, result)
-        return {"run_id": record["id"], "result": result}
+        mode_dir = self.artifact_root / ("formal" if run_mode == "formal" else "latest")
+        artifacts = write_backtest_artifacts(
+            mode_dir, result, int(record["id"]), created_at=record["created_at"]
+        )
+        self.store.update_backtest_artifacts(
+            int(record["id"]), artifacts["artifact_dir"], "pending"
+        )
+        return {
+            "run_id": record["id"],
+            "result": result,
+            "artifacts": artifacts,
+            "analysis_status": "pending",
+        }
+
+    def _resolve_benchmark_inputs(self, spec, args):
+        if not spec.benchmark:
+            return {}, None
+        data = args.get("benchmark_data")
+        if data is None and isinstance(args.get("data"), dict):
+            data = args.get("data")
+        if isinstance(data, dict):
+            return data, None
+        if self.historical_data_provider is None:
+            return {}, _unavailable_historical_result(
+                benchmark_provider_code(spec.benchmark), "未配置历史数据 Provider"
+            )
+        start_date, end_date = resolve_strategy_window(spec)
+        fetched = self.historical_data_provider.fetch(
+            [benchmark_provider_code(spec.benchmark)], start_date, end_date
+        )
+        return fetched.data, fetched
 
     def _get_backtest_result(self, args):
         record = self.store.get_backtest_result(int(args["run_id"]))
         if record is None:
             raise ValueError("找不到回测运行记录：{}".format(args["run_id"]))
         return record
+
+    def _get_backtest_report_context(self, args):
+        from mcp_server.services.analysis import build_report_context
+
+        run_id = int(args["run_id"])
+        record = self.store.get_backtest_result(run_id)
+        if record is None:
+            raise ValueError("找不到回测运行记录：{}".format(run_id))
+        return build_report_context(record, self.store.list_signal_evidence(run_id))
+
+    def _save_backtest_analysis(self, args):
+        from mcp_server.services.analysis import save_analysis_and_render
+
+        return save_analysis_and_render(
+            self.store,
+            int(args["run_id"]),
+            str(args["context_hash"]),
+            args.get("analysis") or {},
+        )
+
+    def _prepare_strategy_revision(self, args):
+        from mcp_server.services.strategy_revision import prepare_strategy_revision
+
+        base = args.get("base_strategy")
+        source_run_id = args.get("source_run_id")
+        if base is None and source_run_id is not None:
+            source = self.store.get_backtest_result(int(source_run_id))
+            if source is not None:
+                version = self.store.get_strategy_version(
+                    source["strategy_id"], source["strategy_version"]
+                )
+                base = version.get("strategy") if version else None
+        base = base or args.get("strategy")
+        proposed = args.get("proposed_strategy") or args.get("strategy")
+        return prepare_strategy_revision(
+            base,
+            proposed,
+            source_run_id=source_run_id,
+            change_details=args.get("change_details"),
+        )
 
     def _compare_backtests(self, args):
         return self.store.compare_backtest_results(args.get("run_ids") or [])
@@ -454,6 +620,7 @@ def run_stdio(application: McpApplication) -> None:
 
 def main() -> None:
     store = build_store(require_workspace=True)
+    workspace = load_workspace(Path.cwd(), required=True)
     market_provider = build_market_provider()
     historical_data_provider = build_historical_data_provider()
     application = McpApplication(
@@ -463,6 +630,7 @@ def main() -> None:
         calendar=build_calendar(require_workspace=True),
         require_data_skill=True,
         historical_data_provider=historical_data_provider,
+        artifact_root=workspace.root / "artifacts",
     )
     run_stdio(application)
 
@@ -511,6 +679,15 @@ def _schedule_payload(schedule) -> Dict[str, Any]:
     for key in ("wake_time", "send_start", "send_end"):
         payload[key] = payload[key].isoformat(timespec="minutes")
     return payload
+
+
+def _unavailable_historical_result(code: Optional[str], reason: str):
+    return HistoricalDataResult(
+        data={},
+        provenance={"source_name": "a-stock-data", "missing_symbols": [code] if code else []},
+        missing_symbols=[code] if code else [],
+        errors={code or "benchmark": reason},
+    )
 
 
 if __name__ == "__main__":

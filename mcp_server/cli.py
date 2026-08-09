@@ -9,7 +9,7 @@ from datetime import date, time
 from pathlib import Path
 
 from mcp_server.domain.models import DailyReportSchedule
-from mcp_server.domain.strategy import StrategySpec
+from mcp_server.domain.strategy import StrategySpec, validate_run_assumptions
 from mcp_server.dependencies import AStockDataSkillError, require_a_stock_data_skill
 from mcp_server.runtime import (
     build_calendar,
@@ -21,6 +21,10 @@ from mcp_server.runtime import (
 )
 from mcp_server.services.runner import DailyReportRunner
 from mcp_server.services.artifacts import write_backtest_artifacts
+from mcp_server.services.backtest_pipeline import (
+    benchmark_provider_code,
+    enrich_backtest_result,
+)
 from mcp_server.services.backtesting import BacktestEngine
 from mcp_server.services.historical_data import (
     HistoricalDataError,
@@ -120,7 +124,19 @@ def main(argv=None) -> int:
             run_mode=args.run_mode,
             confirm_cost_profile=args.confirm_cost_profile,
             confirm_position_sizing=args.confirm_position_sizing,
+            confirm_benchmark=args.confirm_benchmark,
+            confirm_risk_free_rate=args.confirm_risk_free_rate,
             project_root=root,
+        )
+    if args.command == "render-backtest-report":
+        return _render_backtest_report_command(
+            run_id=args.run_id,
+            output_dir=Path(args.output_dir) if args.output_dir else None,
+            confirm_benchmark=args.confirm_benchmark,
+            confirm_risk_free_rate=args.confirm_risk_free_rate,
+            risk_free_rate_annual=args.risk_free_rate_annual,
+            workspace=workspace,
+            store=store,
         )
     if args.command in {"preview", "daily-report"}:
         should_send = args.command == "daily-report" and args.send
@@ -200,6 +216,17 @@ def _parser():
     run.add_argument("--run-mode", choices=["exploratory", "formal"], default="exploratory")
     run.add_argument("--confirm-cost-profile", action="store_true")
     run.add_argument("--confirm-position-sizing", action="store_true")
+    run.add_argument("--confirm-benchmark", action="store_true")
+    run.add_argument("--confirm-risk-free-rate", action="store_true")
+
+    render = subparsers.add_parser(
+        "render-backtest-report", help="从已保存回测事实非破坏性重渲染报告"
+    )
+    render.add_argument("--run-id", required=True, type=int)
+    render.add_argument("--output-dir")
+    render.add_argument("--confirm-benchmark", action="store_true")
+    render.add_argument("--confirm-risk-free-rate", action="store_true")
+    render.add_argument("--risk-free-rate-annual", type=float)
 
     preview = subparsers.add_parser("preview", help="生成但不发送午间观察日报")
     preview.add_argument("--report-date", help="YYYY-MM-DD，默认今天")
@@ -321,6 +348,8 @@ def _run_backtest_command(
     run_mode: str,
     confirm_cost_profile: bool,
     confirm_position_sizing: bool,
+    confirm_benchmark: bool,
+    confirm_risk_free_rate: bool,
     project_root: Path,
     data_provider=None,
 ) -> int:
@@ -337,6 +366,14 @@ def _run_backtest_command(
         policy.setdefault("source_name", "a-stock-data")
         policy.setdefault("source_version", "a-stock-data:{}".format(skill.version))
         payload["data_policy"] = policy
+        assumption_errors = validate_run_assumptions(
+            payload,
+            confirm_benchmark=confirm_benchmark,
+            confirm_risk_free_rate=confirm_risk_free_rate,
+        )
+        if assumption_errors:
+            _print_json({"status": "blocked", "error": "；".join(assumption_errors)})
+            return 2
         spec = StrategySpec.from_dict(payload)
         if not spec.is_valid:
             _print_json({"valid": False, "errors": list(spec.validation_errors)})
@@ -356,6 +393,12 @@ def _run_backtest_command(
                         fetched.errors or "source returned no data",
                     )
                 )
+        benchmark_data = data if spec.benchmark and data_path is not None else {}
+        benchmark_fetched = None
+        if spec.benchmark and data_path is None:
+            benchmark_code = benchmark_provider_code(spec.benchmark)
+            benchmark_fetched = provider.fetch([benchmark_code], start_date, end_date)
+            benchmark_data = benchmark_fetched.data
         if run_mode == "formal":
             if not confirm_cost_profile or not confirm_position_sizing:
                 _print_json({"status": "blocked", "error": "正式回测必须明确确认成本模板和仓位方案"})
@@ -367,14 +410,95 @@ def _run_backtest_command(
         if automatic_provenance:
             result["provenance"].update(automatic_provenance)
         result["run_mode"] = run_mode
+        enrich_backtest_result(
+            result,
+            spec,
+            benchmark_data=benchmark_data,
+            benchmark_provenance=(
+                benchmark_fetched.provenance if benchmark_fetched else None
+            ),
+            benchmark_errors=(benchmark_fetched.errors if benchmark_fetched else None),
+        )
         record = store.save_backtest_run(spec, result)
-        artifacts = write_backtest_artifacts(output_dir, result, int(record["id"]))
-        _print_json({"run_id": int(record["id"]), "artifacts": artifacts, "result": result})
+        artifacts = write_backtest_artifacts(
+            output_dir, result, int(record["id"]), created_at=record["created_at"]
+        )
+        store.update_backtest_artifacts(
+            int(record["id"]), artifacts["artifact_dir"], "pending"
+        )
+        _print_json(
+            {
+                "run_id": int(record["id"]),
+                "artifacts": artifacts,
+                "analysis_status": "pending",
+                "result": result,
+            }
+        )
         return 0
     except AStockDataSkillError as exc:
         _print_json({"status": "blocked", "error": str(exc)})
         return 2
     except (HistoricalDataError, OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        _print_json({"status": "failed", "error": str(exc)})
+        return 2
+
+
+def _render_backtest_report_command(
+    run_id: int,
+    output_dir: Path,
+    confirm_benchmark: bool,
+    confirm_risk_free_rate: bool,
+    risk_free_rate_annual,
+    workspace,
+    store,
+) -> int:
+    try:
+        record = store.get_backtest_result(int(run_id))
+        if record is None:
+            raise ValueError("找不到回测运行记录：{}".format(run_id))
+        if not confirm_benchmark or not confirm_risk_free_rate:
+            raise ValueError("重渲染报告前必须确认 benchmark 选择和年化无风险利率")
+        result = dict(record["result"])
+        assumptions = dict(result.get("assumptions") or {})
+        selected = assumptions.get("benchmark")
+        if "benchmark" not in assumptions:
+            selected = None
+        if risk_free_rate_annual is None:
+            risk_free_rate_annual = assumptions.get("risk_free_rate_annual")
+        if risk_free_rate_annual is None:
+            raise ValueError("旧回测结果未记录无风险利率，请显式提供 --risk-free-rate-annual")
+        result["assumptions"] = {
+            "benchmark": selected,
+            "risk_free_rate_annual": float(risk_free_rate_annual),
+        }
+        base_dir = output_dir
+        if base_dir is None:
+            mode = result.get("run_mode", "latest")
+            base_dir = workspace.root / "artifacts" / (
+                "formal" if mode == "formal" else "latest"
+            )
+        analysis_record = store.get_latest_backtest_analysis(int(run_id))
+        analysis = analysis_record["analysis"] if analysis_record else None
+        artifacts = write_backtest_artifacts(
+            base_dir,
+            result,
+            int(run_id),
+            created_at=record.get("created_at"),
+            analysis=analysis,
+        )
+        store.update_backtest_artifacts(
+            int(run_id), artifacts["artifact_dir"],
+            "saved" if analysis_record else "pending",
+        )
+        _print_json(
+            {
+                "run_id": int(run_id),
+                "artifacts": artifacts,
+                "analysis_status": "saved" if analysis_record else "pending",
+            }
+        )
+        return 0
+    except (OSError, ValueError, TypeError) as exc:
         _print_json({"status": "failed", "error": str(exc)})
         return 2
 

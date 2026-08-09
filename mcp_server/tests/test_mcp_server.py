@@ -15,6 +15,8 @@ def _strategy_payload(version="1.0.0"):
         "entry": {"rules": [{"type": "state", "left": "close", "right": 1}]},
         "exit": {"rules": [{"type": "state", "left": "close", "right": 1}]},
         "position_sizing": {"type": "all_in"},
+        "benchmark": None,
+        "risk_free_rate_annual": 0.0,
     }
 
 
@@ -92,7 +94,15 @@ def test_mcp_persists_backtest_result_and_exposes_evidence(tmp_path):
         {"date": "2026-01-05", "open": 20, "high": 20, "low": 18, "close": 18},
     ]}
 
-    run = app.call_tool("run_backtest", {"strategy": strategy, "data": data})
+    run = app.call_tool(
+        "run_backtest",
+        {
+            "strategy": strategy,
+            "data": data,
+            "confirm_benchmark": True,
+            "confirm_risk_free_rate": True,
+        },
+    )
     run_id = run["structuredContent"]["run_id"]
     loaded = app.call_tool("get_backtest_result", {"run_id": run_id})
     compared = app.call_tool("compare_backtests", {"run_ids": [run_id]})
@@ -130,7 +140,14 @@ def test_mcp_fetches_data_when_run_backtest_data_is_omitted(tmp_path):
             )
 
     app = McpApplication(store=store, historical_data_provider=FakeProvider())
-    result = app.call_tool("run_backtest", {"strategy": _strategy_payload()})
+    result = app.call_tool(
+        "run_backtest",
+        {
+            "strategy": _strategy_payload(),
+            "confirm_benchmark": True,
+            "confirm_risk_free_rate": True,
+        },
+    )
 
     assert result["isError"] is False
     assert result["structuredContent"]["result"]["provenance"]["source_name"] == "fake-a-stock-data"
