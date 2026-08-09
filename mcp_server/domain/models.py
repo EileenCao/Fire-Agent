@@ -58,6 +58,7 @@ class DailyReport:
     content: str
     data_as_of: Optional[datetime]
     status: str
+    snapshots: List[MarketSnapshot] = field(default_factory=list)
 
 
 @dataclass(frozen=True)

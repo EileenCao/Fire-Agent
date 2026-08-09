@@ -37,3 +37,33 @@ def test_schedule_round_trip_uses_noon_send_window(tmp_path):
     assert loaded.send_start == time(12, 3)
     assert loaded.send_end == time(12, 5)
     assert loaded.trading_days_only is True
+
+
+def test_delivery_attempt_records_chunk_and_format_metadata(tmp_path):
+    store = SQLiteStore(tmp_path / "research.sqlite3")
+    store.initialize()
+    report = store.create_report_run(
+        idempotency_key="daily_watchlist:2026-08-10:morning_close:v1",
+        report_date=__import__("datetime").date(2026, 8, 10),
+        session="morning_close",
+        data_as_of="2026-08-10T11:30:00+08:00",
+        status="sending",
+        content="日报",
+    )
+
+    store.record_delivery_attempt(
+        run_id=report["id"],
+        channel_id="feishu-main",
+        attempt=2,
+        status="sent",
+        response_code=200,
+        chunk_index=1,
+        chunk_count=2,
+        content_format="post",
+    )
+
+    latest = store.notification_status()["latest_delivery"]
+    assert latest["attempt"] == 2
+    assert latest["chunk_index"] == 1
+    assert latest["chunk_count"] == 2
+    assert latest["content_format"] == "post"

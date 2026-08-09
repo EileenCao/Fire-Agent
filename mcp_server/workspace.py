@@ -61,6 +61,14 @@ class Workspace:
         return self.root / "logs"
 
     @property
+    def config_dir(self) -> Path:
+        return self.root / "config"
+
+    @property
+    def env_path(self) -> Path:
+        return self.config_dir / ".env"
+
+    @property
     def db_path(self) -> Path:
         return self.root / "stock_research.sqlite3"
 
@@ -96,6 +104,7 @@ def initialize_workspace(
         workspace.formal_artifacts_dir,
         workspace.reports_dir,
         workspace.logs_dir,
+        workspace.config_dir,
     ):
         try:
             path.mkdir(parents=True, exist_ok=True)

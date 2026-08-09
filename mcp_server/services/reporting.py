@@ -46,6 +46,7 @@ class DailyReportBuilder:
             content="\n".join(lines),
             data_as_of=data_as_of,
             status=status,
+            snapshots=items,
         )
 
 

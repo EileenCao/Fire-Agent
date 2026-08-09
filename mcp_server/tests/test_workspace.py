@@ -24,8 +24,10 @@ def test_initialize_workspace_creates_user_data_tree_and_ignored_pointer(tmp_pat
         workspace.formal_artifacts_dir,
         workspace.reports_dir,
         workspace.logs_dir,
+        workspace.config_dir,
     ):
         assert path.is_dir()
+    assert workspace.env_path == workspace.config_dir / ".env"
     assert workspace.db_path.parent == workspace.root
     pointer = project_root / ".fireagent" / "workspace.json"
     assert json.loads(pointer.read_text(encoding="utf-8"))["workspace_path"] == str(

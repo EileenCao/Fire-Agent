@@ -1,3 +1,5 @@
+from datetime import date
+
 from mcp_server.adapters.a_stock_data import parse_tencent_quote_response
 from mcp_server.adapters.a_stock_data import TencentMarketDataProvider
 from mcp_server.domain.models import WatchlistItem
@@ -59,3 +61,21 @@ def test_provider_rejects_quote_after_morning_cutoff():
 
     assert snapshot.price is None
     assert "拒绝混入午间报告" in snapshot.errors[0]
+
+
+def test_provider_rejects_quote_from_another_date_for_morning_report():
+    values = [""] * 53
+    values[1] = "红利ETF"
+    values[3] = "1.234"
+    values[4] = "1.200"
+    values[30] = "20260811113000"
+    raw = 'v_sh512890="{}~{}";'.format("~".join(values), "")
+    provider = TencentMarketDataProvider(session=_Session(raw), skill=None)
+    item = WatchlistItem(code="512890", market="SH", instrument_type="ETF")
+
+    snapshot = provider.snapshots_for(
+        [item], "上午收盘 11:30", report_date=date(2026, 8, 10)
+    )[0]
+
+    assert snapshot.price is None
+    assert "日期" in snapshot.errors[0]

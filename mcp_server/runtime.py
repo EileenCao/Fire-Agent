@@ -16,7 +16,12 @@ from mcp_server.workspace import load_workspace
 def load_local_env(project_root: Optional[Path] = None) -> Dict[str, str]:
     root = project_root or Path.cwd()
     values: Dict[str, str] = {}
-    for path in (root / ".env", root / "config" / ".env"):
+    workspace = load_workspace(root, required=False)
+    paths = []
+    if workspace is not None:
+        paths.append(workspace.env_path)
+    paths.extend((root / ".env", root / "config" / ".env"))
+    for path in paths:
         if not path.exists():
             continue
         for raw_line in path.read_text(encoding="utf-8").splitlines():
