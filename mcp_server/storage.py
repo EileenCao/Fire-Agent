@@ -1,0 +1,374 @@
+"""SQLite persistence for the local research and notification workflow."""
+
+import hashlib
+import json
+import sqlite3
+from datetime import date, time
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Union
+
+from mcp_server.domain.identifiers import normalize_ticker
+from mcp_server.domain.models import DailyReportSchedule, WatchlistItem
+
+
+DEFAULT_DB_PATH = Path("data") / "stock_research.sqlite3"
+
+
+class SQLiteStore:
+    def __init__(self, path: Union[str, Path] = DEFAULT_DB_PATH):
+        self.path = Path(path)
+
+    def initialize(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self._connect() as connection:
+            connection.executescript(
+                """
+                PRAGMA foreign_keys = ON;
+
+                CREATE TABLE IF NOT EXISTS watchlist_items (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    code TEXT NOT NULL,
+                    market TEXT NOT NULL,
+                    instrument_type TEXT NOT NULL CHECK (instrument_type IN ('STOCK', 'ETF')),
+                    name TEXT,
+                    note TEXT NOT NULL DEFAULT '',
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(code, market)
+                );
+
+                CREATE TABLE IF NOT EXISTS notification_channels (
+                    id TEXT PRIMARY KEY,
+                    channel_type TEXT NOT NULL,
+                    display_name TEXT NOT NULL,
+                    endpoint_env TEXT NOT NULL,
+                    secret_env TEXT,
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS report_schedules (
+                    id TEXT PRIMARY KEY,
+                    enabled INTEGER NOT NULL,
+                    timezone TEXT NOT NULL,
+                    wake_time TEXT NOT NULL,
+                    send_start TEXT NOT NULL,
+                    send_end TEXT NOT NULL,
+                    trading_days_only INTEGER NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS report_runs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    idempotency_key TEXT NOT NULL UNIQUE,
+                    report_date TEXT NOT NULL,
+                    session TEXT NOT NULL,
+                    data_as_of TEXT,
+                    status TEXT NOT NULL,
+                    content TEXT,
+                    content_hash TEXT,
+                    error TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS delivery_attempts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id INTEGER NOT NULL,
+                    channel_id TEXT NOT NULL,
+                    attempt INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    response_code INTEGER,
+                    error TEXT,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(run_id) REFERENCES report_runs(id)
+                );
+                """
+            )
+
+    def add_watchlist_item(
+        self,
+        code: str,
+        instrument_type: str = "STOCK",
+        market: Optional[str] = None,
+        name: Optional[str] = None,
+        note: str = "",
+    ) -> WatchlistItem:
+        normalized_code, normalized_market = normalize_ticker(code, market)
+        normalized_type = instrument_type.upper()
+        if normalized_type not in {"STOCK", "ETF"}:
+            raise ValueError("instrument_type 必须是 STOCK 或 ETF")
+        timestamp = _utc_now()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO watchlist_items
+                    (code, market, instrument_type, name, note, enabled, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, 1, ?, ?)
+                ON CONFLICT(code, market) DO UPDATE SET
+                    instrument_type = excluded.instrument_type,
+                    name = excluded.name,
+                    note = excluded.note,
+                    enabled = 1,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    normalized_code,
+                    normalized_market,
+                    normalized_type,
+                    name,
+                    note,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+        return self._find_watchlist_item(normalized_code, normalized_market)
+
+    def remove_watchlist_item(self, code: str, market: Optional[str] = None) -> bool:
+        normalized_code, normalized_market = normalize_ticker(code, market)
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "DELETE FROM watchlist_items WHERE code = ? AND market = ?",
+                (normalized_code, normalized_market),
+            )
+            return cursor.rowcount > 0
+
+    def list_watchlist(self, enabled_only: bool = True) -> List[WatchlistItem]:
+        query = "SELECT * FROM watchlist_items"
+        params: Iterable[Any] = ()
+        if enabled_only:
+            query += " WHERE enabled = 1"
+        query += " ORDER BY market, code"
+        with self._connect() as connection:
+            rows = connection.execute(query, tuple(params)).fetchall()
+        return [_watchlist_from_row(row) for row in rows]
+
+    def watchlist_version(self) -> str:
+        payload = [
+            {
+                "code": item.code,
+                "market": item.market,
+                "instrument_type": item.instrument_type,
+                "name": item.name,
+                "note": item.note,
+                "enabled": item.enabled,
+                "updated_at": item.updated_at,
+            }
+            for item in self.list_watchlist(enabled_only=False)
+        ]
+        encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()[:16]
+
+    def configure_daily_report(
+        self,
+        enabled: bool = True,
+        timezone: str = "Asia/Shanghai",
+        wake_time: time = time(12, 0),
+        send_start: time = time(12, 3),
+        send_end: time = time(12, 5),
+        trading_days_only: bool = True,
+    ) -> DailyReportSchedule:
+        schedule = DailyReportSchedule(
+            enabled=enabled,
+            timezone=timezone,
+            wake_time=wake_time,
+            send_start=send_start,
+            send_end=send_end,
+            trading_days_only=trading_days_only,
+        )
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO report_schedules
+                    (id, enabled, timezone, wake_time, send_start, send_end, trading_days_only)
+                VALUES ('daily_watchlist', ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    enabled = excluded.enabled,
+                    timezone = excluded.timezone,
+                    wake_time = excluded.wake_time,
+                    send_start = excluded.send_start,
+                    send_end = excluded.send_end,
+                    trading_days_only = excluded.trading_days_only
+                """,
+                (
+                    int(enabled),
+                    timezone,
+                    wake_time.isoformat(timespec="minutes"),
+                    send_start.isoformat(timespec="minutes"),
+                    send_end.isoformat(timespec="minutes"),
+                    int(trading_days_only),
+                ),
+            )
+        return schedule
+
+    def get_daily_report_schedule(self) -> DailyReportSchedule:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM report_schedules WHERE id = 'daily_watchlist'"
+            ).fetchone()
+        if row is None:
+            return DailyReportSchedule()
+        return DailyReportSchedule(
+            enabled=bool(row["enabled"]),
+            timezone=row["timezone"],
+            wake_time=time.fromisoformat(row["wake_time"]),
+            send_start=time.fromisoformat(row["send_start"]),
+            send_end=time.fromisoformat(row["send_end"]),
+            trading_days_only=bool(row["trading_days_only"]),
+        )
+
+    def register_feishu_channel(
+        self,
+        channel_id: str = "feishu-main",
+        display_name: str = "飞书私人群",
+        endpoint_env: str = "FEISHU_WEBHOOK_URL",
+        secret_env: str = "FEISHU_WEBHOOK_SECRET",
+    ) -> None:
+        timestamp = _utc_now()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO notification_channels
+                    (id, channel_type, display_name, endpoint_env, secret_env, enabled, created_at, updated_at)
+                VALUES (?, 'feishu_webhook', ?, ?, ?, 1, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    display_name = excluded.display_name,
+                    endpoint_env = excluded.endpoint_env,
+                    secret_env = excluded.secret_env,
+                    updated_at = excluded.updated_at
+                """,
+                (channel_id, display_name, endpoint_env, secret_env, timestamp, timestamp),
+            )
+
+    def create_report_run(
+        self,
+        idempotency_key: str,
+        report_date: date,
+        session: str,
+        data_as_of: Optional[str],
+        status: str,
+        content: Optional[str],
+        error: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        timestamp = _utc_now()
+        content_hash = (
+            hashlib.sha256(content.encode("utf-8")).hexdigest() if content else None
+        )
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO report_runs
+                    (idempotency_key, report_date, session, data_as_of, status, content,
+                     content_hash, error, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    idempotency_key,
+                    report_date.isoformat(),
+                    session,
+                    data_as_of,
+                    status,
+                    content,
+                    content_hash,
+                    error,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM report_runs WHERE idempotency_key = ?",
+                (idempotency_key,),
+            ).fetchone()
+        return dict(row)
+
+    def update_report_run(
+        self,
+        run_id: int,
+        status: str,
+        error: Optional[str] = None,
+    ) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE report_runs SET status = ?, error = ?, updated_at = ? WHERE id = ?",
+                (status, error, _utc_now(), run_id),
+            )
+
+    def get_report_run(self, idempotency_key: str) -> Optional[Dict[str, Any]]:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM report_runs WHERE idempotency_key = ?",
+                (idempotency_key,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def record_delivery_attempt(
+        self,
+        run_id: int,
+        channel_id: str,
+        attempt: int,
+        status: str,
+        response_code: Optional[int] = None,
+        error: Optional[str] = None,
+    ) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO delivery_attempts
+                    (run_id, channel_id, attempt, status, response_code, error, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (run_id, channel_id, attempt, status, response_code, error, _utc_now()),
+            )
+
+    def notification_status(self) -> Dict[str, Any]:
+        with self._connect() as connection:
+            channel = connection.execute(
+                """
+                SELECT id, channel_type, display_name, endpoint_env, secret_env, enabled
+                FROM notification_channels ORDER BY id LIMIT 1
+                """
+            ).fetchone()
+            latest = connection.execute(
+                "SELECT * FROM delivery_attempts ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        return {
+            "channel": dict(channel) if channel else None,
+            "latest_delivery": dict(latest) if latest else None,
+        }
+
+    def _find_watchlist_item(self, code: str, market: str) -> WatchlistItem:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM watchlist_items WHERE code = ? AND market = ?",
+                (code, market),
+            ).fetchone()
+        if row is None:
+            raise RuntimeError("写入观察清单后无法读取记录")
+        return _watchlist_from_row(row)
+
+    def _connect(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(str(self.path))
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys = ON")
+        return connection
+
+
+def _utc_now() -> str:
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _watchlist_from_row(row: sqlite3.Row) -> WatchlistItem:
+    return WatchlistItem(
+        code=row["code"],
+        market=row["market"],
+        instrument_type=row["instrument_type"],
+        name=row["name"],
+        note=row["note"],
+        enabled=bool(row["enabled"]),
+        item_id=row["id"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+    )
