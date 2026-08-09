@@ -1,13 +1,101 @@
 """Deterministic daily-bar engine with explicit A-share execution constraints."""
 
+from dataclasses import dataclass, field
+from datetime import date, timedelta
 from math import floor
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from mcp_server.domain.identifiers import normalize_ticker
+from mcp_server.services.indicators import build_indicator_series
+from mcp_server.services.signal_planner import build_signal_plan
 
 
 REQUIRED_BAR_FIELDS = ("date", "open", "high", "low", "close")
 DEFAULT_LOT_SIZE = 100
+
+
+@dataclass
+class PositionLot:
+    """One buy batch tracked separately so A-share T+1 can be enforced."""
+
+    lot_id: str
+    code: str
+    buy_date: str
+    available_date: str
+    quantity: int
+    price: float
+    cost: float
+    source: str
+
+
+@dataclass
+class PositionBook:
+    """FIFO position book with explicit available quantities."""
+
+    code: str
+    lots: List[PositionLot] = field(default_factory=list)
+
+    def total_quantity(self) -> int:
+        return sum(max(0, lot.quantity) for lot in self.lots)
+
+    def available_quantity(self, day: str) -> int:
+        return sum(
+            max(0, lot.quantity)
+            for lot in self.lots
+            if lot.quantity > 0 and lot.available_date <= day
+        )
+
+    def quantity_before(self, day: str) -> int:
+        return sum(
+            max(0, lot.quantity)
+            for lot in self.lots
+            if lot.quantity > 0 and lot.buy_date < day
+        )
+
+    def average_cost(self) -> Optional[float]:
+        quantity = self.total_quantity()
+        if quantity <= 0:
+            return None
+        return sum(lot.cost for lot in self.lots if lot.quantity > 0) / quantity
+
+    def market_value(self, price: float) -> float:
+        return self.total_quantity() * float(price)
+
+    def add(self, lot: PositionLot) -> None:
+        self.lots.append(lot)
+
+    def sell(self, quantity: int, day: str) -> Tuple[int, List[Tuple[str, int, float]]]:
+        remaining = max(0, int(quantity))
+        allocations: List[Tuple[str, int, float]] = []
+        for lot in self.lots:
+            if remaining <= 0:
+                break
+            if lot.quantity <= 0 or lot.available_date > day:
+                continue
+            sold = min(lot.quantity, remaining)
+            unit_cost = lot.cost / lot.quantity
+            allocated_cost = unit_cost * sold
+            lot.quantity -= sold
+            lot.cost -= allocated_cost
+            remaining -= sold
+            allocations.append((lot.lot_id, sold, allocated_cost))
+        self.lots = [lot for lot in self.lots if lot.quantity > 0]
+        return quantity - remaining, allocations
+
+
+@dataclass(frozen=True)
+class PendingOrder:
+    code: str
+    side: str
+    source: str
+    signal_date: str
+    execute_date: str
+    reason: str
+    config: Dict[str, Any] = field(default_factory=dict)
+    requested_quantity: Optional[int] = None
+    amount: Optional[float] = None
+    funding: str = "existing_cash"
+    intraday_price: Optional[float] = None
 
 
 class BacktestEngine:
@@ -54,232 +142,746 @@ class BacktestEngine:
         return result
 
     def _run_scenario(self, spec, data, scenario: str) -> Dict[str, Any]:
+        sizing = spec.position_sizing or {}
+        if sizing.get("capital_scope", "per_symbol") == "portfolio":
+            return self._run_portfolio(spec, data, scenario)
+
         allocation = spec.initial_capital / max(1, len(data))
         total_equity: Dict[str, float] = {}
         all_trades: List[Dict[str, Any]] = []
-        warnings: List[str] = []
+        all_warnings: List[str] = []
+        cash_flows: List[Dict[str, Any]] = []
+        positions: Dict[str, Any] = {}
         for code, bars in data.items():
             outcome = self._run_symbol(spec, code, bars, allocation, scenario)
             all_trades.extend(outcome["trades"])
-            warnings.extend(outcome["warnings"])
+            all_warnings.extend(outcome["warnings"])
+            cash_flows.extend(outcome["cash_flows"])
+            positions[code] = outcome["positions"]
             for day, equity in outcome["equity_curve"].items():
                 total_equity[day] = total_equity.get(day, 0.0) + equity
         if not total_equity:
             total_equity = {"": spec.initial_capital}
         values = [total_equity[key] for key in sorted(total_equity)]
-        metrics = _metrics(spec.initial_capital, values, all_trades)
+        metrics = _metrics(spec.initial_capital, total_equity, values, all_trades, cash_flows)
         return {
             "scenario": scenario,
             "equity_curve": total_equity,
             "trades": all_trades,
+            "cash_flows": cash_flows,
+            "positions": positions,
             "metrics": metrics,
-            "warnings": sorted(set(warnings)),
+            "warnings": sorted(set(all_warnings)),
         }
 
-    def _run_symbol(self, spec, code, bars, allocation, scenario):
-        cash = allocation
-        quantity = 0
-        entry_price: Optional[float] = None
-        entry_cost = 0.0
-        entry_date: Optional[str] = None
-        pending = None
-        trades: List[Dict[str, Any]] = []
-        warnings: List[str] = []
-        equity_curve: Dict[str, float] = {}
+    def _run_symbol(self, spec, code, raw_bars, allocation, scenario):
+        if _uses_close_execution(spec):
+            return self._run_symbol_close_execution(
+                spec, code, raw_bars, allocation, scenario
+            )
+
+        bars = list(raw_bars)
+        dates = [str(bar["date"]) for bar in bars]
         closes = [float(bar["close"]) for bar in bars]
         lot_size = _lot_size(spec)
+        book = PositionBook(code)
+        cash = float(allocation)
+        pending: List[PendingOrder] = []
+        trades: List[Dict[str, Any]] = []
+        warnings: List[str] = []
+        cash_flows: List[Dict[str, Any]] = []
+        equity_curve: Dict[str, float] = {}
+        periodic_events = _periodic_events(spec, bars)
+        order_number = 0
 
         for index, bar in enumerate(bars):
             day = str(bar["date"])
+            next_day = _next_date(dates, day)
             suspended = bool(bar.get("suspended") or bar.get("is_suspended"))
 
-            if pending:
-                pending_trade, filled, cash, quantity, entry_price, entry_cost, entry_date = (
-                    self._execute_pending(
-                        spec,
-                        code,
-                        bar,
-                        pending,
-                        cash,
-                        quantity,
-                        entry_price,
-                        entry_cost,
-                        entry_date,
-                        allocation,
-                        lot_size,
+            for event in periodic_events.get(day, []):
+                if book.total_quantity() > 0:
+                    pending.append(
+                        _periodic_order(code, event, day)
                     )
-                )
-                trades.append(pending_trade)
-                if not filled:
-                    warnings.append(pending_trade["reason"])
-                pending = None
 
-            if quantity > 0 and entry_date != day:
+            due = [order for order in pending if order.execute_date == day]
+            pending = [order for order in pending if order.execute_date != day]
+            due.sort(key=lambda order: _order_sort_key(spec, order, 0))
+            for order in due:
+                order_number += 1
+                trade, cash, flow, order_warnings = self._execute_order(
+                    spec,
+                    code,
+                    bar,
+                    order,
+                    book,
+                    cash,
+                    allocation,
+                    lot_size,
+                    next_day,
+                    order_number,
+                )
+                trades.append(trade)
+                if flow:
+                    cash_flows.append(flow)
+                warnings.extend(order_warnings)
+
+            if book.quantity_before(day) > 0:
                 dividend = _as_float(bar.get("cash_dividend"))
                 if dividend and dividend > 0:
-                    amount = quantity * dividend
+                    amount = book.quantity_before(day) * dividend
                     cash += amount
                     warnings.append(
                         "{} {} 分红单独入账：{:.8f}".format(code, day, amount)
                     )
 
-                if not suspended:
-                    stop_take = _stop_take_trigger(spec, bar, entry_price, scenario)
-                    if stop_take is not None:
-                        reason, exit_price = stop_take
-                        blocked = _blocked_reason(bar, "SELL", exit_price)
-                        if blocked:
-                            unfilled = _unfilled_trade(
-                                code,
-                                "SELL",
-                                day,
-                                day,
-                                exit_price,
-                                quantity,
-                                "{}；止盈止损无法成交".format(blocked),
-                            )
-                            trades.append(unfilled)
-                            warnings.append(unfilled["reason"])
-                        else:
-                            sell_trade, cash = _close_position(
-                                spec,
-                                code,
-                                day,
-                                day,
-                                exit_price,
-                                quantity,
-                                entry_cost,
-                                reason,
-                                cash,
-                            )
-                            trades.append(sell_trade)
-                            quantity = 0
-                            entry_price = None
-                            entry_cost = 0.0
-                            entry_date = None
+            if book.total_quantity() > 0 and not suspended:
+                average_cost = book.average_cost()
+                stop_take = _stop_take_trigger(spec, bar, average_cost, scenario)
+                if stop_take is not None:
+                    reason, exit_price = stop_take
+                    order_number += 1
+                    trade, cash, flow, order_warnings = self._execute_order(
+                        spec,
+                        code,
+                        bar,
+                        PendingOrder(
+                            code=code,
+                            side="SELL",
+                            source=reason,
+                            signal_date=day,
+                            execute_date=day,
+                            reason=reason,
+                            requested_quantity=book.available_quantity(day),
+                            intraday_price=exit_price,
+                        ),
+                        book,
+                        cash,
+                        allocation,
+                        lot_size,
+                        next_day,
+                        order_number,
+                    )
+                    trades.append(trade)
+                    if flow:
+                        cash_flows.append(flow)
+                    warnings.extend(order_warnings)
 
             if suspended:
                 warnings.append("{} {} 停牌，无法产生或执行交易".format(code, day))
-            elif quantity == 0 and _rules_match(spec.entry, index, closes):
-                pending = {"side": "BUY", "signal_date": day, "reason": "ENTRY_RULE"}
-            elif quantity > 0 and _rules_match(spec.exit, index, closes):
-                pending = {"side": "SELL", "signal_date": day, "reason": "EXIT_RULE"}
-            equity_curve[day] = cash + quantity * float(bar["close"])
+            else:
+                entry_match = _rules_match(spec.entry, index, closes)
+                exit_match = _rules_match(spec.exit, index, closes)
+                if book.total_quantity() == 0 and entry_match:
+                    _queue_next_order(
+                        pending,
+                        PendingOrder(
+                            code=code,
+                            side="BUY",
+                            source="SIGNAL_BUY",
+                            signal_date=day,
+                            execute_date=next_day or day,
+                            reason="ENTRY_RULE",
+                            config=dict(spec.position_sizing or {}),
+                        ),
+                    )
+                elif book.total_quantity() > 0:
+                    if exit_match:
+                        _queue_next_order(
+                            pending,
+                            PendingOrder(
+                                code=code,
+                                side="SELL",
+                                source="SELL",
+                                signal_date=day,
+                                execute_date=next_day or day,
+                                reason="EXIT_RULE",
+                            ),
+                        )
+                    signal_add = _signal_add_config(spec)
+                    if entry_match and signal_add:
+                        _queue_next_order(
+                            pending,
+                            PendingOrder(
+                                code=code,
+                                side="BUY",
+                                source="SIGNAL_BUY",
+                                signal_date=day,
+                                execute_date=next_day or day,
+                                reason="ENTRY_RULE_ADD",
+                                config=signal_add,
+                            ),
+                        )
 
-        if quantity > 0:
+            equity_curve[day] = cash + book.market_value(float(bar["close"]))
+
+        if book.total_quantity() > 0:
             warnings.append("{} 数据结束时仍有未平仓头寸，按最后收盘价估值".format(code))
-        return {"trades": trades, "equity_curve": equity_curve, "warnings": warnings}
+        return {
+            "trades": trades,
+            "equity_curve": equity_curve,
+            "warnings": warnings,
+            "cash_flows": cash_flows,
+            "positions": _position_snapshot(book),
+        }
 
-    def _execute_pending(
+    def _run_symbol_close_execution(self, spec, code, raw_bars, allocation, scenario):
+        """Run an explicitly configured condition-count strategy at the close."""
+
+        bars = list(raw_bars)
+        dates = [str(bar["date"]) for bar in bars]
+        lot_size = _lot_size(spec)
+        indicator_series = build_indicator_series(spec, bars)
+        book = PositionBook(code)
+        cash = float(allocation)
+        trades: List[Dict[str, Any]] = []
+        warnings: List[str] = []
+        equity_curve: Dict[str, float] = {}
+        cash_flows: List[Dict[str, Any]] = []
+        order_number = 0
+
+        for index, bar in enumerate(bars):
+            day = str(bar["date"])
+            next_day = _next_date(dates, day)
+            suspended = bool(bar.get("suspended") or bar.get("is_suspended"))
+
+            if book.total_quantity() > 0 and not suspended:
+                stop_take = _stop_take_trigger(spec, bar, book.average_cost(), scenario)
+                if stop_take is not None:
+                    reason, exit_price = stop_take
+                    order_number += 1
+                    trade, cash, flow, order_warnings = self._execute_order(
+                        spec,
+                        code,
+                        bar,
+                        PendingOrder(
+                            code=code,
+                            side="SELL",
+                            source=reason,
+                            signal_date=day,
+                            execute_date=day,
+                            reason=reason,
+                            requested_quantity=book.available_quantity(day),
+                            intraday_price=exit_price,
+                            config={"cost_basis": "weighted_average"},
+                        ),
+                        book,
+                        cash,
+                        allocation,
+                        lot_size,
+                        next_day,
+                        order_number,
+                    )
+                    trades.append(trade)
+                    warnings.extend(order_warnings)
+                    if flow:
+                        cash_flows.append(flow)
+
+            if suspended:
+                warnings.append("{} {} 鍋滅墝锛屾棤娉曚骇鐢熸垨鎵ц浜ゆ槗".format(code, day))
+            else:
+                plan = build_signal_plan(
+                    spec,
+                    bars,
+                    index,
+                    book.total_quantity(),
+                    indicator_series=indicator_series,
+                )
+                if plan["action"] in {"BUY", "SELL"}:
+                    order_number += 1
+                    config = {
+                        "type": "recurrent_cash",
+                        "amount": plan["buy_cash"],
+                        "lot_size": lot_size,
+                        "signal_evidence": plan["evidence"],
+                        "cost_basis": "weighted_average",
+                    }
+                    order = PendingOrder(
+                        code=code,
+                        side=plan["action"],
+                        source="SIGNAL_BUY" if plan["action"] == "BUY" else "SELL",
+                        signal_date=day,
+                        execute_date=day,
+                        reason="ENTRY_RULE" if plan["action"] == "BUY" else "EXIT_RULE",
+                        config=config,
+                        requested_quantity=(
+                            plan["sell_quantity"] if plan["action"] == "SELL" else None
+                        ),
+                        intraday_price=float(bar["close"]),
+                    )
+                    trade, cash, flow, order_warnings = self._execute_order(
+                        spec,
+                        code,
+                        bar,
+                        order,
+                        book,
+                        cash,
+                        allocation,
+                        lot_size,
+                        next_day,
+                        order_number,
+                    )
+                    trades.append(trade)
+                    warnings.extend(order_warnings)
+                    if flow:
+                        cash_flows.append(flow)
+
+            equity_curve[day] = cash + book.market_value(float(bar["close"]))
+
+        if book.total_quantity() > 0:
+            warnings.append("{} 鏁版嵁缁撴潫鏃朵粛鏈夋湭骞充粨澶村锛屾寜鏈€鍚庢敹鐩樹环浼板€?".format(code))
+        return {
+            "trades": trades,
+            "equity_curve": equity_curve,
+            "warnings": warnings,
+            "cash_flows": cash_flows,
+            "positions": _position_snapshot(book),
+        }
+
+    def _run_portfolio(self, spec, data, scenario):
+        codes = list(data)
+        bars_by_code = {code: list(bars) for code, bars in data.items()}
+        maps = {
+            code: {str(bar["date"]): bar for bar in bars}
+            for code, bars in bars_by_code.items()
+        }
+        dates = sorted({day for values in maps.values() for day in values})
+        books = {code: PositionBook(code) for code in codes}
+        pending: List[PendingOrder] = []
+        last_close: Dict[str, float] = {}
+        equity_curve: Dict[str, float] = {}
+        trades: List[Dict[str, Any]] = []
+        warnings: List[str] = []
+        cash_flows: List[Dict[str, Any]] = []
+        cash = float(spec.initial_capital)
+        event_maps = {code: _periodic_events(spec, bars_by_code[code]) for code in codes}
+        indices = {code: 0 for code in codes}
+        order_number = 0
+
+        for day in dates:
+            eligible_periodic = []
+            for code in codes:
+                event = event_maps[code].get(day, [])
+                if books[code].total_quantity() > 0:
+                    eligible_periodic.extend((code, item) for item in event)
+            for code, event in eligible_periodic:
+                config = dict(event["config"])
+                if config.get("funding") == "external_contribution" and len(eligible_periodic) > 1:
+                    if config.get("amount") is not None:
+                        config["amount"] = float(config["amount"]) / len(eligible_periodic)
+                pending.append(_periodic_order(code, {"planned_date": event["planned_date"], "config": config}, day))
+
+            due = [order for order in pending if order.execute_date == day]
+            pending = [order for order in pending if order.execute_date != day]
+            due.sort(key=lambda order: _order_sort_key(spec, order, codes.index(order.code)))
+            for order in due:
+                bar = maps[order.code].get(day)
+                if bar is None:
+                    continue
+                order_number += 1
+                next_day = _next_date(sorted(maps[order.code]), day)
+                trade, cash, flow, order_warnings = self._execute_order(
+                    spec,
+                    order.code,
+                    bar,
+                    order,
+                    books[order.code],
+                    cash,
+                    spec.initial_capital,
+                    _lot_size(spec),
+                    next_day,
+                    order_number,
+                )
+                trades.append(trade)
+                if flow:
+                    cash_flows.append(flow)
+                warnings.extend(order_warnings)
+
+            for code in codes:
+                bar = maps[code].get(day)
+                if bar is None:
+                    continue
+                index = indices[code]
+                indices[code] += 1
+                last_close[code] = float(bar["close"])
+                book = books[code]
+                if book.quantity_before(day) > 0:
+                    dividend = _as_float(bar.get("cash_dividend"))
+                    if dividend and dividend > 0:
+                        cash += book.quantity_before(day) * dividend
+
+                suspended = bool(bar.get("suspended") or bar.get("is_suspended"))
+                if book.total_quantity() > 0 and not suspended:
+                    stop_take = _stop_take_trigger(
+                        spec, bar, book.average_cost(), scenario
+                    )
+                    if stop_take is not None:
+                        reason, exit_price = stop_take
+                        order_number += 1
+                        trade, cash, flow, order_warnings = self._execute_order(
+                            spec,
+                            code,
+                            bar,
+                            PendingOrder(
+                                code=code,
+                                side="SELL",
+                                source=reason,
+                                signal_date=day,
+                                execute_date=day,
+                                reason=reason,
+                                requested_quantity=book.available_quantity(day),
+                                intraday_price=exit_price,
+                            ),
+                            book,
+                            cash,
+                            spec.initial_capital,
+                            _lot_size(spec),
+                            _next_date(sorted(maps[code]), day),
+                            order_number,
+                        )
+                        trades.append(trade)
+                        if flow:
+                            cash_flows.append(flow)
+                        warnings.extend(order_warnings)
+
+                if suspended:
+                    warnings.append("{} {} 停牌，无法产生或执行交易".format(code, day))
+                    continue
+                closes = [float(item["close"]) for item in bars_by_code[code][:index + 1]]
+                entry_match = _rules_match(spec.entry, index, closes)
+                exit_match = _rules_match(spec.exit, index, closes)
+                next_day = _next_date(sorted(maps[code]), day)
+                if book.total_quantity() == 0 and entry_match and next_day:
+                    _queue_next_order(
+                        pending,
+                        PendingOrder(
+                            code=code,
+                            side="BUY",
+                            source="SIGNAL_BUY",
+                            signal_date=day,
+                            execute_date=next_day,
+                            reason="ENTRY_RULE",
+                            config=dict(spec.position_sizing or {}),
+                        ),
+                    )
+                elif book.total_quantity() > 0:
+                    if exit_match and next_day:
+                        _queue_next_order(
+                            pending,
+                            PendingOrder(
+                                code=code,
+                                side="SELL",
+                                source="SELL",
+                                signal_date=day,
+                                execute_date=next_day,
+                                reason="EXIT_RULE",
+                            ),
+                        )
+                    signal_add = _signal_add_config(spec)
+                    if entry_match and signal_add and next_day:
+                        _queue_next_order(
+                            pending,
+                            PendingOrder(
+                                code=code,
+                                side="BUY",
+                                source="SIGNAL_BUY",
+                                signal_date=day,
+                                execute_date=next_day,
+                                reason="ENTRY_RULE_ADD",
+                                config=signal_add,
+                            ),
+                        )
+
+            equity_curve[day] = cash + sum(
+                books[code].market_value(last_close[code])
+                for code in last_close
+            )
+
+        for code, book in books.items():
+            if book.total_quantity() > 0:
+                warnings.append("{} 数据结束时仍有未平仓头寸，按最后收盘价估值".format(code))
+        return {
+            "scenario": scenario,
+            "equity_curve": equity_curve,
+            "trades": trades,
+            "cash_flows": cash_flows,
+            "positions": {code: _position_snapshot(book) for code, book in books.items()},
+            "metrics": _metrics(spec.initial_capital, equity_curve, list(equity_curve.values()), trades, cash_flows),
+            "warnings": sorted(set(warnings)),
+        }
+
+    def _execute_order(
         self,
         spec,
         code,
         bar,
-        pending,
+        order,
+        book,
         cash,
-        quantity,
-        entry_price,
-        entry_cost,
-        entry_date,
         allocation,
         lot_size,
+        next_day,
+        order_number,
     ):
         day = str(bar["date"])
-        raw_price = float(bar["open"])
-        blocked = _blocked_reason(bar, pending["side"], raw_price)
+        raw_price = float(order.intraday_price if order.intraday_price is not None else bar["open"])
+        rates = _cost_profile(spec)
+        cash_before = cash
+        flow = None
+        warnings = []
+        order_config = order.config or {}
+        signal_evidence = order_config.get("signal_evidence")
+        if order.funding == "external_contribution":
+            amount = _as_float(order.amount)
+            if amount and amount > 0:
+                cash += amount
+                flow = {
+                    "type": "external_contribution",
+                    "date": day,
+                    "code": code,
+                    "amount": round(amount, 8),
+                    "source": order.source,
+                }
+        blocked = _blocked_reason(bar, order.side, raw_price)
+        order_id = "{}-{}-{}".format(code, day, order_number)
+        position_before = book.total_quantity()
+        available_before = book.available_quantity(day)
+        requested_sell = order.requested_quantity
+        if order.side == "SELL" and requested_sell is None:
+            requested_sell = _sell_quantity(spec, book, day, lot_size)
         if blocked:
             return (
                 _unfilled_trade(
                     code,
-                    pending["side"],
+                    order.side,
                     day,
-                    pending["signal_date"],
+                    order.signal_date,
                     raw_price,
-                    quantity if pending["side"] == "SELL" else 0,
+                    requested_sell if order.side == "SELL" else order.requested_quantity or 0,
                     "{}；订单未成交".format(blocked),
+                    order_id=order_id,
+                    source=order.source,
+                    requested_quantity=(
+                        requested_sell
+                        if order.side == "SELL"
+                        else order.requested_quantity
+                    ),
+                    position_before=position_before,
+                    position_after=position_before,
+                    available_quantity_before=available_before,
+                    cash_before=cash_before,
+                    cash_after=cash,
                 ),
-                False,
                 cash,
-                quantity,
-                entry_price,
-                entry_cost,
-                entry_date,
+                flow,
+                ["{} {} {}：订单未成交".format(code, day, blocked)],
             )
 
-        rates = _cost_profile(spec)
-        if pending["side"] == "BUY" and quantity == 0:
-            fill_price = raw_price * (1 + rates["slippage_rate"])
-            target_cash = _target_cash(spec, allocation)
-            estimated_fee = _fee(rates, fill_price, 1, target_cash)
-            affordable = max(0.0, target_cash - estimated_fee)
-            target_quantity = floor(affordable / fill_price / lot_size) * lot_size
-            if target_quantity <= 0:
-                trade = _unfilled_trade(
-                    code,
-                    "BUY",
-                    day,
-                    pending["signal_date"],
-                    raw_price,
-                    0,
-                    "资金不足或不足一个交易单位，订单未成交",
+        if order.side == "BUY":
+            config = order_config or dict(spec.position_sizing or {})
+            requested = _buy_requested_quantity(config, lot_size)
+            fill_price = raw_price * (1 + float(rates["slippage_rate"]))
+            target_cash = _buy_target_cash(config, cash, allocation)
+            max_quantity = _affordable_quantity(rates, fill_price, cash, lot_size)
+            if requested is None:
+                requested = floor(target_cash / fill_price / lot_size) * lot_size
+                target_quantity = max_quantity if target_cash >= cash else _affordable_quantity(
+                    rates, fill_price, min(cash, target_cash), lot_size
                 )
-                return trade, False, cash, quantity, entry_price, entry_cost, entry_date
+            else:
+                target_quantity = min(requested, max_quantity)
+            target_quantity = floor(max(0, target_quantity) / lot_size) * lot_size
+            if target_quantity <= 0:
+                return (
+                    _unfilled_trade(
+                        code,
+                        "BUY",
+                        day,
+                        order.signal_date,
+                        raw_price,
+                        requested or 0,
+                        "资金不足或不足一个交易单位，订单未成交",
+                        order_id=order_id,
+                        source=order.source,
+                        requested_quantity=requested,
+                        position_before=position_before,
+                        position_after=position_before,
+                        available_quantity_before=available_before,
+                        cash_before=cash_before,
+                        cash_after=cash,
+                    ),
+                    cash,
+                    flow,
+                    ["{} {} 买入资金不足或不足一个交易单位".format(code, day)],
+                )
             gross = target_quantity * fill_price
             fee = _fee(rates, fill_price, target_quantity, gross)
-            cash -= gross + fee
+            total = gross + fee
+            if total > cash:
+                target_quantity = _affordable_quantity(rates, fill_price, cash, lot_size)
+                gross = target_quantity * fill_price
+                fee = _fee(rates, fill_price, target_quantity, gross)
+                total = gross + fee
+            if target_quantity <= 0 or total > cash:
+                return (
+                    _unfilled_trade(
+                        code,
+                        "BUY",
+                        day,
+                        order.signal_date,
+                        raw_price,
+                        requested or 0,
+                        "资金不足，订单未成交",
+                        order_id=order_id,
+                        source=order.source,
+                        requested_quantity=requested,
+                        position_before=position_before,
+                        position_after=position_before,
+                        available_quantity_before=available_before,
+                        cash_before=cash_before,
+                        cash_after=cash,
+                    ),
+                    cash,
+                    flow,
+                    ["{} {} 买入资金不足".format(code, day)],
+                )
+            cash -= total
+            lot_id = order_id + "-lot"
+            book.add(
+                PositionLot(
+                    lot_id=lot_id,
+                    code=code,
+                    buy_date=day,
+                    available_date=next_day or "9999-12-31",
+                    quantity=target_quantity,
+                    price=fill_price,
+                    cost=total,
+                    source=order.source,
+                )
+            )
+            status = "PARTIAL" if requested is not None and target_quantity < requested else "FILLED"
             trade = {
+                "order_id": order_id,
                 "code": code,
                 "side": "BUY",
+                "source": order.source,
                 "date": day,
-                "signal_date": pending["signal_date"],
+                "signal_date": order.signal_date,
                 "price": round(fill_price, 8),
                 "raw_price": raw_price,
                 "quantity": target_quantity,
+                "requested_quantity": requested,
+                "filled_quantity": target_quantity,
                 "fee": round(fee, 8),
-                "reason": pending["reason"],
+                "position_before": position_before,
+                "position_after": book.total_quantity(),
+                "available_quantity_before": available_before,
+                "cash_before": cash_before,
+                "cash_after": round(cash, 8),
+                "lot_id": lot_id,
+                "lot_ids": [lot_id],
+                "status": status,
+                "reason": order.reason,
             }
+            if signal_evidence is not None:
+                trade["signal_evidence"] = signal_evidence
+            if status == "PARTIAL":
+                warnings.append("{} {} 买入数量因资金不足被截断".format(code, day))
+            return trade, cash, flow, warnings
+
+        requested = requested_sell
+        if requested <= 0 or available_before <= 0:
             return (
-                trade,
-                True,
+                _unfilled_trade(
+                    code,
+                    "SELL",
+                    day,
+                    order.signal_date,
+                    raw_price,
+                    requested,
+                    "没有可卖持仓，订单未成交",
+                    order_id=order_id,
+                    source=order.source,
+                    requested_quantity=requested,
+                    position_before=position_before,
+                    position_after=position_before,
+                    available_quantity_before=available_before,
+                    cash_before=cash_before,
+                    cash_after=cash,
+                ),
                 cash,
-                target_quantity,
-                fill_price,
-                gross + fee,
-                day,
+                flow,
+                ["{} {} 没有可卖持仓".format(code, day)],
             )
-
-        if pending["side"] == "SELL" and quantity > 0:
-            fill_price = raw_price * (1 - rates["slippage_rate"])
-            trade, cash = _close_position(
-                spec,
-                code,
-                day,
-                pending["signal_date"],
-                fill_price,
-                quantity,
-                entry_cost,
-                pending["reason"],
+        target_quantity = floor(min(requested, available_before) / lot_size) * lot_size
+        if target_quantity <= 0:
+            return (
+                _unfilled_trade(
+                    code,
+                    "SELL",
+                    day,
+                    order.signal_date,
+                    raw_price,
+                    requested,
+                    "卖出数量不足一个交易单位，订单未成交",
+                    order_id=order_id,
+                    source=order.source,
+                    requested_quantity=requested,
+                    position_before=position_before,
+                    position_after=position_before,
+                    available_quantity_before=available_before,
+                    cash_before=cash_before,
+                    cash_after=cash,
+                ),
                 cash,
+                flow,
+                ["{} {} 卖出数量不足一个交易单位".format(code, day)],
             )
-            return trade, True, cash, 0, None, 0.0, None
-
-        return (
-            _unfilled_trade(
-                code,
-                pending["side"],
-                day,
-                pending["signal_date"],
-                raw_price,
-                quantity,
-                "当前持仓状态与订单不匹配，订单未成交",
-            ),
-            False,
-            cash,
-            quantity,
-            entry_price,
-            entry_cost,
-            entry_date,
-        )
+        fill_price = raw_price * (1 - float(rates["slippage_rate"]))
+        average_cost_before = book.average_cost()
+        actual, allocations = book.sell(target_quantity, day)
+        gross = actual * fill_price
+        fee = _fee(rates, fill_price, actual, gross, side="SELL")
+        revenue = gross - fee
+        cash += revenue
+        if order_config.get("cost_basis") == "weighted_average" and average_cost_before is not None:
+            allocated_cost = average_cost_before * actual
+        else:
+            allocated_cost = sum(item[2] for item in allocations)
+        clipped = actual < requested
+        status = "PARTIAL" if clipped else "FILLED"
+        if clipped:
+            warnings.append(
+                "{} {} 请求卖出 {}，实际可卖 {}，已按可卖数量截断".format(
+                    code, day, requested, actual
+                )
+            )
+        trade = {
+            "order_id": order_id,
+            "code": code,
+            "side": "SELL",
+            "source": order.source,
+            "date": day,
+            "signal_date": order.signal_date,
+            "price": round(fill_price, 8),
+            "quantity": actual,
+            "requested_quantity": requested,
+            "filled_quantity": actual,
+            "fee": round(fee, 8),
+            "pnl": round(revenue - allocated_cost, 8),
+            "position_before": position_before,
+            "position_after": book.total_quantity(),
+            "available_quantity_before": available_before,
+            "cash_before": cash_before,
+            "cash_after": round(cash, 8),
+            "lot_ids": [item[0] for item in allocations],
+            "status": status,
+            "reason": order.reason,
+        }
+        if signal_evidence is not None:
+            trade["signal_evidence"] = signal_evidence
+        return trade, cash, flow, warnings
 
     def _validation_summary(self, spec, data, scenarios):
         dates = sorted({str(bar["date"]) for bars in data.values() for bar in bars})
@@ -319,6 +921,184 @@ class BacktestEngine:
                 "windows": _rolling_windows(dates, spec.validation),
             },
         }
+
+
+def _periodic_events(spec, bars):
+    sizing = spec.position_sizing or {}
+    config = (sizing.get("while_holding") or {}).get("periodic") or {}
+    if not config or not config.get("enabled", True):
+        return {}
+    bar_dates = sorted(str(bar["date"]) for bar in bars)
+    if not bar_dates:
+        return {}
+    first = date.fromisoformat(bar_dates[0])
+    last = date.fromisoformat(bar_dates[-1])
+    frequency = config.get("frequency")
+    planned_dates = []
+    if frequency == "dates":
+        planned_dates = [date.fromisoformat(str(value)) for value in config.get("dates", [])]
+    else:
+        current = first
+        while current <= last:
+            if frequency == "weekly" and current.weekday() == int(config.get("weekday", 0)):
+                planned_dates.append(current)
+            elif frequency == "monthly" and current.day == int(config.get("day", 1)):
+                planned_dates.append(current)
+            current += timedelta(days=1)
+
+    result = {}
+    bar_date_set = set(bar_dates)
+    for planned in sorted(planned_dates):
+        planned_text = planned.isoformat()
+        if planned_text in bar_date_set:
+            base = planned_text
+        elif config.get("non_trading_day", "skip") == "next_trading_day":
+            base = next((value for value in bar_dates if value > planned_text), None)
+        else:
+            continue
+        if base is None:
+            continue
+        execution = (
+            base
+            if config.get("execution", "next_open") == "scheduled_open"
+            else _next_date(bar_dates, base)
+        )
+        if execution is not None:
+            result.setdefault(execution, []).append(
+                {"planned_date": planned_text, "config": dict(config)}
+            )
+    return result
+
+
+def _periodic_order(code, event, execute_date):
+    config = dict(event["config"])
+    return PendingOrder(
+        code=code,
+        side="BUY",
+        source="PERIODIC_BUY",
+        signal_date=str(event["planned_date"]),
+        execute_date=str(execute_date),
+        reason="PERIODIC_DCA",
+        config=config,
+        requested_quantity=_buy_requested_quantity(config, _config_lot_size(config)),
+        amount=_as_float(config.get("amount", config.get("cash"))),
+        funding=str(config.get("funding", "existing_cash")),
+    )
+
+
+def _config_lot_size(config):
+    try:
+        return max(1, int(config.get("lot_size", DEFAULT_LOT_SIZE)))
+    except (TypeError, ValueError):
+        return DEFAULT_LOT_SIZE
+
+
+def _signal_add_config(spec):
+    config = (spec.position_sizing or {}).get("while_holding", {}).get("signal_add")
+    if not isinstance(config, dict) or not config.get("enabled", True):
+        return None
+    return dict(config)
+
+
+def _queue_next_order(pending, order):
+    for existing in pending:
+        if (
+            existing.code == order.code
+            and existing.side == order.side
+            and existing.source == order.source
+            and existing.execute_date == order.execute_date
+        ):
+            return
+    pending.append(order)
+
+
+def _order_sort_key(spec, order, code_index):
+    priority = list(spec.action_priority or [])
+    action = order.source if order.source in {"PERIODIC_BUY", "SIGNAL_BUY"} else order.side
+    try:
+        rank = priority.index(action)
+    except ValueError:
+        rank = len(priority)
+    return rank, code_index, order.signal_date, order.source
+
+
+def _next_date(dates, current):
+    return next((value for value in sorted(dates) if value > str(current)), None)
+
+
+def _position_snapshot(book):
+    return [
+        {
+            "lot_id": lot.lot_id,
+            "code": lot.code,
+            "buy_date": lot.buy_date,
+            "available_date": lot.available_date,
+            "quantity": lot.quantity,
+            "price": round(lot.price, 8),
+            "cost": round(lot.cost, 8),
+            "source": lot.source,
+        }
+        for lot in book.lots
+        if lot.quantity > 0
+    ]
+
+
+def _buy_requested_quantity(config, lot_size):
+    if str(config.get("type", "all_in")) != "fixed_quantity":
+        return None
+    try:
+        return floor(int(config.get("quantity", 0)) / lot_size) * lot_size
+    except (TypeError, ValueError):
+        return 0
+
+
+def _buy_target_cash(config, cash, allocation):
+    kind = str(config.get("type", "all_in"))
+    if kind == "recurrent_cash":
+        return min(cash, float(config.get("amount", config.get("cash", 0.0))))
+    if kind == "fixed_cash":
+        return min(cash, float(config.get("cash", config.get("amount", cash))))
+    if kind in {"cash_pct", "fixed_fraction"}:
+        fraction = float(config.get("fraction", config.get("amount", 1.0)))
+        return max(0.0, cash * fraction)
+    if kind == "fixed_quantity":
+        return cash
+    return max(0.0, min(cash, allocation))
+
+
+def _affordable_quantity(rates, price, cash, lot_size):
+    if cash <= 0 or price <= 0:
+        return 0
+    quantity = floor(cash / price / lot_size) * lot_size
+    while quantity > 0:
+        gross = quantity * price
+        if gross + _fee(rates, price, quantity, gross) <= cash + 1e-9:
+            return quantity
+        quantity -= lot_size
+    return 0
+
+
+def _sell_quantity(spec, book, day, lot_size):
+    available = book.available_quantity(day)
+    total = book.total_quantity()
+    sell = (spec.exit or {}).get("sell") or {}
+    kind = sell.get("type", "all")
+    if kind == "percent":
+        return floor(total * float(sell.get("value", 1.0)) / lot_size) * lot_size
+    if kind == "quantity":
+        return max(0, int(sell.get("value", 0)))
+    return available
+
+
+def _uses_close_execution(spec):
+    execution = getattr(spec, "execution", {}) or {}
+    sizing = spec.position_sizing or {}
+    return (
+        execution.get("signal_at") == "close"
+        and execution.get("fill_at") == "close"
+        and sizing.get("type") == "recurrent_cash"
+        and (spec.entry or {}).get("mode") == "count_conditions"
+    )
 
 
 def _normalize_data(spec, data):
@@ -370,7 +1150,13 @@ def _normalize_data(spec, data):
     return normalized, warnings, actions
 
 
-def _metrics(initial: float, values: List[float], trades: List[Dict[str, Any]]):
+def _metrics(
+    initial: float,
+    equity_curve: Dict[str, float],
+    values: List[float],
+    trades: List[Dict[str, Any]],
+    cash_flows: Optional[List[Dict[str, Any]]] = None,
+):
     final = values[-1] if values else initial
     peak = initial
     max_drawdown = 0.0
@@ -378,12 +1164,35 @@ def _metrics(initial: float, values: List[float], trades: List[Dict[str, Any]]):
         peak = max(peak, value)
         if peak:
             max_drawdown = max(max_drawdown, (peak - value) / peak)
-    completed = [trade for trade in trades if trade.get("side") == "SELL" and trade.get("status") != "UNFILLED"]
+    cash_flows = list(cash_flows or [])
+    external = sum(float(flow.get("amount", 0.0)) for flow in cash_flows)
+    flow_by_day = {}
+    for flow in cash_flows:
+        flow_by_day[flow.get("date")] = flow_by_day.get(flow.get("date"), 0.0) + float(
+            flow.get("amount", 0.0)
+        )
+    time_weighted = 1.0
+    previous = initial
+    for day in sorted(equity_curve):
+        base = previous + flow_by_day.get(day, 0.0)
+        current = float(equity_curve[day])
+        if base > 0:
+            time_weighted *= current / base
+        previous = current
+    completed = [
+        trade
+        for trade in trades
+        if trade.get("side") == "SELL" and trade.get("status") != "UNFILLED"
+    ]
     wins = [trade for trade in completed if trade.get("pnl", 0) > 0]
     return {
         "initial_capital": initial,
         "final_equity": round(final, 8),
-        "cumulative_return": round(final / initial - 1, 8),
+        "external_cash_flow": round(external, 8),
+        "total_contributed": round(initial + external, 8),
+        "net_profit": round(final - initial - external, 8),
+        "cumulative_return": round(final / initial - 1, 8) if not external else None,
+        "time_weighted_return": round(time_weighted - 1, 8),
         "max_drawdown": round(max_drawdown, 8),
         "trade_count": len(completed),
         "win_rate": round(len(wins) / len(completed), 8) if completed else None,
@@ -445,6 +1254,7 @@ def _provenance(spec, data, actions):
         "data_end": max(dates) if dates else None,
         "frequency": spec.frequency,
         "price_basis": policy.get("price_basis", "adjusted"),
+        "execution": dict(getattr(spec, "execution", {}) or {}),
         "corporate_actions": actions,
         "cost_profile": _cost_profile(spec, include_defaults=True),
     }
@@ -473,28 +1283,17 @@ def _fee(rates, price, quantity, gross, side="BUY"):
     return commission + transfer + stamp
 
 
-def _close_position(spec, code, day, signal_date, price, quantity, entry_cost, reason, cash):
-    rates = _cost_profile(spec)
-    gross = quantity * price
-    fee = _fee(rates, price, quantity, gross, side="SELL")
-    revenue = gross - fee
-    pnl = revenue - entry_cost
+def _unfilled_trade(
+    code,
+    side,
+    day,
+    signal_date,
+    price,
+    quantity,
+    reason,
+    **fields,
+):
     trade = {
-        "code": code,
-        "side": "SELL",
-        "date": day,
-        "signal_date": signal_date,
-        "price": round(price, 8),
-        "quantity": quantity,
-        "fee": round(fee, 8),
-        "pnl": round(pnl, 8),
-        "reason": reason,
-    }
-    return trade, cash + revenue
-
-
-def _unfilled_trade(code, side, day, signal_date, price, quantity, reason):
-    return {
         "code": code,
         "side": side,
         "date": day,
@@ -504,6 +1303,8 @@ def _unfilled_trade(code, side, day, signal_date, price, quantity, reason):
         "status": "UNFILLED",
         "reason": reason,
     }
+    trade.update({key: value for key, value in fields.items() if value is not None})
+    return trade
 
 
 def _blocked_reason(bar, side, price):
@@ -552,16 +1353,6 @@ def _stop_take_trigger(spec, bar, entry_price, scenario):
         price = stop if reason == "STOP_LOSS" else take
         return reason, price
     return ("STOP_LOSS", stop) if stop is not None else ("TAKE_PROFIT", take)
-
-
-def _target_cash(spec, allocation):
-    sizing = spec.position_sizing or {}
-    kind = sizing.get("type", "all_in")
-    if kind == "fixed_cash":
-        return min(allocation, float(sizing.get("cash", allocation)))
-    if kind == "fixed_fraction":
-        return allocation * float(sizing.get("fraction", 1.0))
-    return allocation
 
 
 def _lot_size(spec):
