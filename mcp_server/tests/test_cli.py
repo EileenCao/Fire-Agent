@@ -57,6 +57,7 @@ def test_real_market_provider_fails_when_required_skill_is_missing(tmp_path, mon
 
 
 def test_cli_notification_status_reports_configuration_without_sending(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr("mcp_server.calendar._load_xshg_calendar", lambda: None)
     monkeypatch.chdir(tmp_path)
     workspace_path = tmp_path.parent / (tmp_path.name + "-FireAgentWorkspace")
     assert main(["init", "--workspace", str(workspace_path)]) == 0
@@ -74,3 +75,4 @@ def test_cli_notification_status_reports_configuration_without_sending(tmp_path,
     result = json.loads(capsys.readouterr().out)
     assert result["webhook_configured"] is True
     assert result["network_send_performed"] is False
+    assert result["calendar_authoritative"] is False

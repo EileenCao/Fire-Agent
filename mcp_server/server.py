@@ -401,6 +401,8 @@ class McpApplication:
         value = self.store.notification_status()
         value["webhook_configured"] = self.notifier is not None
         value["schedule"] = _schedule_payload(self.store.get_daily_report_schedule())
+        value["calendar_source"] = self.calendar.source
+        value["calendar_authoritative"] = self.calendar.is_authoritative
         value["network_send_performed"] = False
         return value
 

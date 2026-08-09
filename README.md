@@ -444,6 +444,12 @@ python -m mcp_server.cli notification-status
 python -m mcp_server.cli notification-test --message "FireAgent 通知测试"
 ```
 
+正式定时推送还需要可靠的 A 股交易日历。程序优先使用 `exchange-calendars` 的 `XSHG` 日历；也可以在独立工作区建立 `data/trading_holidays.json`，由用户维护节假日配置。两者都不存在时，`daily-report --send` 会返回 `blocked_calendar_unavailable` 并阻止发送，不会把普通工作日当成交易日：
+
+```powershell
+python -m pip install exchange-calendars
+```
+
 交易日午间日报由 Windows 任务计划程序每天 12:00 唤醒，程序设置为项目 Python，参数为 `-m mcp_server.cli daily-report --send`，工作目录为 FireAgent 项目根目录。运行器自行检查 A 股交易日历，并在配置的 12:03–12:05 窗口发送；非交易日只记录跳过，不推送。手工试跑或预览可以使用：
 
 ```powershell

@@ -81,8 +81,11 @@ def main(argv=None) -> int:
         return 0
     if args.command == "notification-status":
         value = store.notification_status()
+        calendar = build_calendar(root, require_workspace=True)
         value["webhook_configured"] = build_notifier() is not None
         value["schedule"] = asdict(store.get_daily_report_schedule())
+        value["calendar_source"] = calendar.source
+        value["calendar_authoritative"] = calendar.is_authoritative
         value["network_send_performed"] = False
         _print_json(value)
         return 0

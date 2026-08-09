@@ -1,5 +1,6 @@
 from mcp_server.server import McpApplication, McpStdioServer, tool_definitions
 from mcp_server.adapters.feishu import DeliveryResult
+from mcp_server.calendar import TradingCalendar
 from mcp_server.services.historical_data import HistoricalDataResult
 from mcp_server.storage import SQLiteStore
 
@@ -147,10 +148,11 @@ def test_mcp_stdio_initialize_and_tools_list_are_json_rpc_results(tmp_path):
     assert any(tool["name"] == "watchlist_add" for tool in listed["result"]["tools"])
 
 
-def test_mcp_notification_status_does_not_send_and_exposes_schedule(tmp_path):
+def test_mcp_notification_status_does_not_send_and_exposes_schedule(tmp_path, monkeypatch):
+    monkeypatch.setattr("mcp_server.calendar._load_xshg_calendar", lambda: None)
     store = SQLiteStore(tmp_path / "research.sqlite3")
     store.initialize()
-    app = McpApplication(store=store, notifier=None)
+    app = McpApplication(store=store, notifier=None, calendar=TradingCalendar())
 
     result = app.call_tool("get_notification_status")
 
@@ -158,6 +160,7 @@ def test_mcp_notification_status_does_not_send_and_exposes_schedule(tmp_path):
     assert result["structuredContent"]["webhook_configured"] is False
     assert result["structuredContent"]["network_send_performed"] is False
     assert result["structuredContent"]["schedule"]["wake_time"] == "12:00"
+    assert result["structuredContent"]["calendar_authoritative"] is False
 
 
 def test_mcp_test_notification_uses_configured_notifier(tmp_path):
