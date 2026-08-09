@@ -32,4 +32,12 @@ description: Use when a user wants to clarify, formalize, version, or backtest a
 
 ## Required Output
 
+## 回测前确认与策略修订审批
+
+每次调用 `run_backtest` 前，必须向用户确认 `benchmark`（具体基准或明确的 `null`）以及 `risk_free_rate_annual`，然后将确认结果作为 `confirm_benchmark` 和 `confirm_risk_free_rate` 传给 MCP。正式模式还要确认成本模板和仓位方案。
+
+首次回测后的任何调整都先调用 `prepare_strategy_revision`。逐项展示 JSON 路径、旧值、新值、原因、证据、预期影响、风险，以及保持不变的基准、无风险利率、成本、仓位和验证口径。用户明确批准完整 diff 后，才可调用 `save_strategy_version`，并传入父版本、来源 run、批准 diff 哈希和 `user_confirmed=true`。旧版本不得覆盖；保存新版本后仍需重新确认回测口径。
+
+策略修改和回测都不自动执行：AI 不直接改写策略、不自动重跑、不自动下单。真实 A 股数据仍必须来自已安装的 `a-stock-data` Skill。
+
 先输出“待确认策略摘要”，再输出校验结果、数据缺口和下一步。未确认时不要运行正式回测。所有流程不自动下单，只生成研究结果和建议。

@@ -358,6 +358,9 @@ def _run_backtest_command(
         payload = _read_json(strategy_path)
         automatic_provenance = None
         data = {} if data_path is None else _read_json(data_path)
+        if data_path is not None:
+            data, cached_provenance = _normalize_backtest_data(data)
+            automatic_provenance = cached_provenance
         if not isinstance(data, dict):
             raise ValueError("回测数据必须是按标的代码分组的 JSON 对象")
         policy = dict(payload.get("data_policy") or {})
@@ -397,8 +400,16 @@ def _run_backtest_command(
         benchmark_fetched = None
         if spec.benchmark and data_path is None:
             benchmark_code = benchmark_provider_code(spec.benchmark)
-            benchmark_fetched = provider.fetch([benchmark_code], start_date, end_date)
-            benchmark_data = benchmark_fetched.data
+            try:
+                benchmark_fetched = provider.fetch([benchmark_code], start_date, end_date)
+                benchmark_data = benchmark_fetched.data
+            except Exception as exc:
+                benchmark_fetched = HistoricalDataResult(
+                    data={},
+                    provenance={"source_name": "a-stock-data"},
+                    missing_symbols=[benchmark_code],
+                    errors={benchmark_code: str(exc)},
+                )
         if run_mode == "formal":
             if not confirm_cost_profile or not confirm_position_sizing:
                 _print_json({"status": "blocked", "error": "正式回测必须明确确认成本模板和仓位方案"})
@@ -505,6 +516,20 @@ def _render_backtest_report_command(
 
 def _read_json(path: Path):
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _normalize_backtest_data(payload):
+    """Accept either the engine map or one cached symbol wrapper."""
+
+    if (
+        isinstance(payload, dict)
+        and payload.get("code")
+        and isinstance(payload.get("bars"), list)
+    ):
+        return {str(payload["code"]): payload["bars"]}, dict(
+            payload.get("provenance") or {}
+        )
+    return payload, None
 
 
 if __name__ == "__main__":

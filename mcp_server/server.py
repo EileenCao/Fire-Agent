@@ -445,9 +445,11 @@ class McpApplication:
                 benchmark_provider_code(spec.benchmark), "未配置历史数据 Provider"
             )
         start_date, end_date = resolve_strategy_window(spec)
-        fetched = self.historical_data_provider.fetch(
-            [benchmark_provider_code(spec.benchmark)], start_date, end_date
-        )
+        code = benchmark_provider_code(spec.benchmark)
+        try:
+            fetched = self.historical_data_provider.fetch([code], start_date, end_date)
+        except Exception as exc:
+            fetched = _unavailable_historical_result(code, str(exc))
         return fetched.data, fetched
 
     def _get_backtest_result(self, args):

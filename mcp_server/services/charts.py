@@ -25,7 +25,8 @@ def render_report_charts(result: Dict[str, Any], charts_dir: Path) -> Dict[str, 
         warnings.append("净值/回撤图生成失败：{}".format(exc))
     for scenario_name, scenario in result.get("scenarios", {}).items():
         try:
-            paths["monthly_returns_{}".format(scenario_name)] = str(
+            safe_name = _safe_name(scenario_name)
+            paths["monthly_returns_{}".format(safe_name)] = str(
                 _monthly_returns_chart(scenario, scenario_name, charts_dir, plt)
             )
         except Exception as exc:

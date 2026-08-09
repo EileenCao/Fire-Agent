@@ -28,4 +28,12 @@ description: Use when a saved backtest needs metric interpretation, risk review,
 
 ## Required Output
 
+## Deterministic context and write-back contract
+
+回测完成后，先调用 `get_backtest_report_context`。只使用该上下文中的指标、验证摘要、警告分类、代表交易和 `evidence_ids`；不要把完整历史数据或未经工具返回的数字写入分析。
+
+分析必须按以下字段返回：`summary`、`strengths`、`risks`、`data_limitations`、`experiments`。每一条都必须是带 `evidence_refs` 的对象，候选实验最多三个。确认上下文哈希未过期后，调用 `save_backtest_analysis`；工具会验证证据引用并更新同一 run 的 `analysis.json` 与 `report.md`。
+
+AI 分析只解释确定性结果，不修改 `result.json`，不自动修改策略，不自动运行下一次回测，也不自动下单。若用户想调整策略，转交 `strategy-workbench` 生成逐字段 diff，并等待用户对完整 diff 的最终确认。
+
 按“结果摘要 → 风险与缺口 → 证据 → 可选实验 → 用户确认点”输出。所有建议都是研究建议，不自动下单。

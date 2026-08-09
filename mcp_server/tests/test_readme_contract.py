@@ -59,3 +59,15 @@ def test_readme_documents_feishu_scheduled_delivery():
     assert "daily-report --send" in content
     assert "20 KB" in content
     assert "双向对话" in content
+
+
+def test_readme_documents_enhanced_backtest_contract():
+    readme = Path(__file__).parents[2] / "README.md"
+    content = readme.read_text(encoding="utf-8")
+
+    assert "confirm-benchmark" in content
+    assert "confirm-risk-free-rate" in content
+    assert "analysis.json" in content
+    assert "charts/" in content
+    assert "render-backtest-report" in content
+    assert "prepare_strategy_revision" in content

@@ -67,6 +67,12 @@ python -m pip install "mootdx>=0.10" requests pandas stockstats
 python -m pip install pyarrow
 ```
 
+报告图表使用 Matplotlib；图表不是回测计算的前置条件，但建议安装：
+
+```powershell
+python -m pip install matplotlib
+```
+
 核心依赖说明：
 
 - `mootdx>=0.10`：通达信行情、日线、财务快照和 F10；FireAgent 会通过数据适配器连接通达信 TCP 服务。
@@ -208,7 +214,7 @@ chmod +x scripts/sync.sh
 }
 ```
 
-正常回测会根据 `validation.start_date` 和 `validation.end_date` 自动通过 `a-stock-data` 准备历史日线；未指定时默认使用最近四年至今天。数据会保存到工作区的 `data/raw/` 和 `data/parquet/`，结果写入 `artifacts/latest/`（正式模式写入 `artifacts/formal/`）。返回结果会标注来源、来源 URL、Skill 版本、复权口径、数据时间、缺失标的和错误。
+正常回测会根据 `validation.start_date` 和 `validation.end_date` 自动通过 `a-stock-data` 准备历史日线；未指定时默认使用最近四年至今天。数据会保存到工作区的 `data/raw/` 和 `data/parquet/`，结果写入 `artifacts/latest/`（正式模式写入 `artifacts/formal/`）。每次运行会自动创建独立目录 `YYYYMMDD-HHmmss_<strategy_id>_v<version>_run-<id>/`，不会覆盖旧运行。返回结果会标注来源、来源 URL、Skill 版本、复权口径、数据时间、缺失标的和错误。
 
 腾讯历史接口单次默认最多返回最近约 640 条记录，因此 Provider 会把较长日期窗口按日期段拆分请求；每个请求的日期参数使用 `YYYY-MM-DD`，单次 `limit` 不超过 640。所有分段结果会合并、按日期去重并排序，再交给回测引擎，避免长期回测窗口被单次请求截断。
 
@@ -220,24 +226,41 @@ chmod +x scripts/sync.sh
 python -m mcp_server.cli validate-strategy --file .\path\to\your-strategy.json
 ```
 
+策略还必须显式包含以下两项；`benchmark: null` 是明确选择不使用基准，不能省略。每次回测前都要由用户确认这两项：
+
+```json
+{
+  "benchmark": null,
+  "risk_free_rate_annual": 0.02
+}
+```
+
 运行本地探索性回测并生成可审阅产物：
 
 ```powershell
-python -m mcp_server.cli run-backtest
+python -m mcp_server.cli run-backtest `
+  --confirm-benchmark `
+  --confirm-risk-free-rate
 ```
 
 如果策略不在工作区默认位置，可以显式指定策略；仍然不需要 `--data`：
 
 ```powershell
 python -m mcp_server.cli run-backtest `
-  --strategy .\path\to\your-strategy.json
+  --strategy .\path\to\your-strategy.json `
+  --confirm-benchmark `
+  --confirm-risk-free-rate
 ```
 
-输出目录包含：
+每次运行的实际目录由命令输出中的 `artifacts.artifact_dir` 给出，包含：
 
-- `result.json`：结构化结果、指标、验证切分、来源和警告；
-- `report.md`：适合阅读和分享的回测报告；
-- `trades.csv`：成交与明确标记的未成交订单。
+- `report.md`：摘要正文、详细附录、图表和 AI 分析状态；
+- `result.json`：不可由 AI 修改的确定性事实、指标、验证切分、来源和警告；
+- `trades.csv`：成交与明确标记的未成交订单，包含 FIFO 批次和执行证据；
+- `analysis.json`：版本化 AI 分析，初始状态为 `pending`；
+- `charts/`：净值/回撤、各情景月度收益和交易盈亏 PNG。Matplotlib 不可用时仍生成文字报告，并在警告中说明原因。
+
+报告基础指标包括最终权益、净利润、时间加权收益、年化收益、波动率、下行波动率、最大回撤及恢复日期、Sharpe/Sortino/Calmar、胜率、利润因子、盈亏比、期望收益、成交率、费用拆分、换手率、平均/最高仓位、在场时间和样本内外验证。样本不足或字段缺失显示“不可用”，不使用猜测值。
 
 探索性回测不会替用户确认成本或仓位。需要运行正式模式时，必须显式确认两者：
 
@@ -246,10 +269,22 @@ python -m mcp_server.cli run-backtest `
   --strategy .\path\to\your-strategy.json `
   --run-mode formal `
   --confirm-cost-profile `
-  --confirm-position-sizing
+  --confirm-position-sizing `
+  --confirm-benchmark `
+  --confirm-risk-free-rate
 ```
 
 正式模式默认把产物写到工作区 `artifacts/formal/`。只有离线重放时才需要额外添加 `--data .\path\to\your-daily-data.json`。
+
+旧结果或已有 run 可使用以下命令非破坏性重渲染；它只更新该 run 的独立目录，不删除旧的根目录文件：
+
+```powershell
+python -m mcp_server.cli render-backtest-report `
+  --run-id 2 `
+  --confirm-benchmark `
+  --confirm-risk-free-rate `
+  --risk-free-rate-annual 0.02
+```
 
 ### 6. 启动 MCP stdio 服务
 
@@ -276,6 +311,9 @@ activate_strategy
 prepare_backtest_data
 run_backtest
 get_backtest_result
+get_backtest_report_context
+save_backtest_analysis
+prepare_strategy_revision
 compare_backtests
 observe_active_strategy
 get_signal_evidence
@@ -309,8 +347,10 @@ python -m pytest -q
 2. Agent 使用 `strategy-workbench` 把自然语言整理为可审阅的策略版本；
 3. 用户确认后保存并激活版本，再准备数据和运行回测；
 4. `backtest-analysis` 分析收益、回撤、交易、样本内外差异、缺口和证据，并提出可选实验；
-5. 用户确认实验后才运行新回测；
-6. `daily-strategy-observer` 在日维度输出规则信号和证据，AI 观察单独成栏，不修改规则结果。
+5. Agent 读取 `get_backtest_report_context`，每条 AI 判断和实验都引用返回的 `evidence_ids`，再通过 `save_backtest_analysis` 写回 `analysis.json`；
+6. 如果要调整策略，先用 `prepare_strategy_revision` 展示完整逐字段 diff，逐项与用户讨论，用户明确批准完整 diff 后才保存新版本；
+7. 用户确认实验和新的 benchmark、无风险利率、成本、仓位后才运行新回测；
+8. `daily-strategy-observer` 在日维度输出规则信号和证据，AI 观察单独成栏，不修改规则结果。
 
 系统只提供研究建议和证据，不自动下单，也不把“回测结果好”自动标成策略通过。
 
@@ -424,6 +464,18 @@ PowerShell 不能直接执行 `.sh`。请使用 Git Bash 或 WSL，或者改用�
 ### 回测报告出现缺口或未成交
 
 这是显式数据质量结果，不应静默忽略。查看 `result.json` 的 `warnings`、情景警告和 `trades.csv` 中的 `UNFILLED` 行，确认停牌、涨跌停、缺失字段或成本模板是否符合预期。
+
+### 报告没有图表
+
+先运行 `python -m pip install matplotlib`。即使 Matplotlib、字体或单张图生成失败，回测和 `report.md` 仍应完成；在 `result.json.artifact_warnings` 和报告的图表警告中查看具体原因。
+
+### AI 分析写回失败
+
+重新调用 `get_backtest_report_context`，不要复用旧的 `context_hash`。检查每条 `summary`、`strengths`、`risks`、`data_limitations` 和 `experiments` 是否为带 `evidence_refs` 的对象数组，且每个引用都来自当前上下文的 `evidence_ids`。
+
+### 修改策略没有保存
+
+这是审批保护：先调用 `prepare_strategy_revision`，与用户逐项确认完整 diff，再将同一份 `change_set`、`approved_diff_hash`、`parent_version` 和 `user_confirmed=true` 传给 `save_strategy_version`。旧版本不会被覆盖。
 
 ### 如何启用通知
 

@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 from mcp_server.cli import main
 from mcp_server.services.historical_data import HistoricalDataResult
@@ -21,6 +22,7 @@ def _write_inputs(tmp_path):
         "position_sizing": {"type": "all_in"},
         "benchmark": None,
         "risk_free_rate_annual": 0.0,
+        "cost_profile": {"template": "theoretical", "version": "1.0.0"},
         "data_policy": {"source_name": "fixture", "source_version": "a-stock-data:3.6.0"},
     }
     data = {"512890": [
@@ -179,6 +181,55 @@ def test_cli_fetches_data_automatically_into_the_user_workspace(
 
     result = json.loads(capsys.readouterr().out)
     assert result["result"]["provenance"]["source_name"] == "fake-a-stock-data"
-    artifact_dir = __import__("pathlib").Path(result["artifacts"]["artifact_dir"])
+    artifact_dir = Path(result["artifacts"]["artifact_dir"])
     assert artifact_dir.parent == workspace_path / "artifacts" / "latest"
     assert (artifact_dir / "result.json").exists()
+
+
+def test_cli_renders_an_existing_run_without_touching_unrelated_root_files(
+    tmp_path, monkeypatch, capsys
+):
+    skill_path = tmp_path / "skills" / "a-stock-data" / "SKILL.md"
+    _write_skill(skill_path)
+    monkeypatch.setenv("A_STOCK_DATA_SKILL_PATH", str(skill_path))
+    monkeypatch.chdir(tmp_path)
+    workspace_path = _init_workspace(tmp_path, capsys)
+    strategy_path, data_path = _write_inputs(tmp_path)
+    legacy = workspace_path / "artifacts" / "formal"
+    legacy.mkdir(parents=True, exist_ok=True)
+    legacy_report = legacy / "report.md"
+    legacy_report.write_text("legacy report", encoding="utf-8")
+
+    assert main(
+        [
+            "run-backtest",
+            "--strategy",
+            str(strategy_path),
+            "--data",
+            str(data_path),
+            "--run-mode",
+            "formal",
+            "--confirm-cost-profile",
+            "--confirm-position-sizing",
+            "--confirm-benchmark",
+            "--confirm-risk-free-rate",
+        ]
+    ) == 0
+    run_output = json.loads(capsys.readouterr().out)
+    run_id = run_output["run_id"]
+
+    assert main(
+        [
+            "render-backtest-report",
+            "--run-id",
+            str(run_id),
+            "--confirm-benchmark",
+            "--confirm-risk-free-rate",
+            "--risk-free-rate-annual",
+            "0.02",
+        ]
+    ) == 0
+    rendered = json.loads(capsys.readouterr().out)
+
+    assert legacy_report.read_text(encoding="utf-8") == "legacy report"
+    assert Path(rendered["artifacts"]["report"]).exists()
