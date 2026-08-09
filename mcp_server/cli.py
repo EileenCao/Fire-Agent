@@ -13,6 +13,7 @@ from mcp_server.domain.strategy import StrategySpec
 from mcp_server.dependencies import AStockDataSkillError, require_a_stock_data_skill
 from mcp_server.runtime import (
     build_calendar,
+    build_historical_data_provider,
     build_market_provider,
     build_notifier,
     build_store,
@@ -21,6 +22,13 @@ from mcp_server.runtime import (
 from mcp_server.services.runner import DailyReportRunner
 from mcp_server.services.artifacts import write_backtest_artifacts
 from mcp_server.services.backtesting import BacktestEngine
+from mcp_server.services.historical_data import (
+    HistoricalDataError,
+    attach_data_provenance,
+    resolve_strategy_window,
+)
+from mcp_server.sync import SyncError, sync_project
+from mcp_server.workspace import WorkspaceError, initialize_workspace, load_workspace
 
 
 def main(argv=None) -> int:
@@ -31,8 +39,19 @@ def main(argv=None) -> int:
 
     if args.command == "doctor":
         return _doctor(root)
+    if args.command == "sync":
+        return _sync(root)
+    if args.command == "init":
+        return _init_workspace(root, Path(args.workspace), args.overwrite)
+    if args.command == "validate-strategy":
+        return _validate_strategy_file(Path(args.file))
 
-    store = build_store(root)
+    try:
+        workspace = load_workspace(root, required=True)
+        store = build_store(root, require_workspace=True)
+    except WorkspaceError as exc:
+        _print_json({"status": "blocked", "error": str(exc)})
+        return 2
     if args.command == "watchlist-add":
         item = store.add_watchlist_item(
             args.code,
@@ -60,17 +79,25 @@ def main(argv=None) -> int:
         )
         _print_json(asdict(schedule))
         return 0
-    if args.command == "validate-strategy":
-        return _validate_strategy_file(Path(args.file))
     if args.command == "run-backtest":
+        strategy_path = Path(args.strategy) if args.strategy else workspace.strategy_path
+        data_path = Path(args.data) if args.data else None
+        output_dir = (
+            Path(args.output_dir)
+            if args.output_dir
+            else workspace.formal_artifacts_dir
+            if args.run_mode == "formal"
+            else workspace.latest_artifacts_dir
+        )
         return _run_backtest_command(
-            strategy_path=Path(args.strategy),
-            data_path=Path(args.data),
-            output_dir=Path(args.output_dir),
+            strategy_path=strategy_path,
+            data_path=data_path,
+            output_dir=output_dir,
             store=store,
             run_mode=args.run_mode,
             confirm_cost_profile=args.confirm_cost_profile,
             confirm_position_sizing=args.confirm_position_sizing,
+            project_root=root,
         )
     if args.command in {"preview", "daily-report"}:
         notifier = build_notifier() if args.send else None
@@ -79,9 +106,9 @@ def main(argv=None) -> int:
             return 2
         runner = DailyReportRunner(
             store=store,
-            market_provider=build_market_provider(),
+            market_provider=build_market_provider(root),
             notifier=notifier,
-            calendar=build_calendar(root),
+            calendar=build_calendar(root, require_workspace=True),
         )
         result = runner.run(
             date.fromisoformat(args.report_date) if args.report_date else date.today(),
@@ -101,6 +128,11 @@ def _parser():
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     subparsers.add_parser("doctor", help="检查本地运行环境，不访问飞书")
+    subparsers.add_parser("sync", help="校验 Skill 并生成项目级 Codex MCP 配置")
+
+    init = subparsers.add_parser("init", help="初始化用户提供的独立工作区")
+    init.add_argument("--workspace", required=True, help="用户确认的独立工作区绝对路径")
+    init.add_argument("--overwrite", action="store_true", help="明确覆盖已有工作区指针")
 
     add = subparsers.add_parser("watchlist-add", help="添加观察标的")
     add.add_argument("code")
@@ -126,9 +158,9 @@ def _parser():
     validate.add_argument("--file", required=True)
 
     run = subparsers.add_parser("run-backtest", help="运行本地日线回测")
-    run.add_argument("--strategy", required=True)
-    run.add_argument("--data", required=True, help="JSON 格式的日线数据文件")
-    run.add_argument("--output-dir", required=True)
+    run.add_argument("--strategy", help="策略文件；省略时使用工作区 strategies\\strategy.json")
+    run.add_argument("--data", help="可选的离线 JSON 日线数据；省略时自动通过 a-stock-data 获取")
+    run.add_argument("--output-dir")
     run.add_argument("--run-mode", choices=["exploratory", "formal"], default="exploratory")
     run.add_argument("--confirm-cost-profile", action="store_true")
     run.add_argument("--confirm-position-sizing", action="store_true")
@@ -148,6 +180,18 @@ def _doctor(root: Path) -> int:
     store = build_store(root)
     calendar = build_calendar(root)
     try:
+        workspace = load_workspace(root, required=False)
+        workspace_result = (
+            {"status": "ok", "path": str(workspace.root)}
+            if workspace is not None
+            else {
+                "status": "missing",
+                "message": "请先询问用户提供独立工作区，并运行 init --workspace <路径>",
+            }
+        )
+    except WorkspaceError as exc:
+        workspace_result = {"status": "invalid", "error": str(exc)}
+    try:
         skill = require_a_stock_data_skill()
         skill_result = {
             "status": "ok",
@@ -164,6 +208,7 @@ def _doctor(root: Path) -> int:
         "sqlite": sqlite3.sqlite_version,
         "database": str(store.path),
         "database_exists": store.path.exists(),
+        "workspace": workspace_result,
         "calendar_source": calendar.source,
         "a_stock_data_skill": skill_result,
         "watchlist_count": len(store.list_watchlist()),
@@ -175,6 +220,38 @@ def _doctor(root: Path) -> int:
     }
     _print_json(result)
     return skill_exit_code
+
+
+def _sync(root: Path) -> int:
+    try:
+        _print_json(sync_project(root))
+        return 0
+    except (AStockDataSkillError, SyncError, OSError) as exc:
+        _print_json({"status": "blocked", "error": str(exc)})
+        return 2
+
+
+def _init_workspace(root: Path, workspace_path: Path, overwrite: bool) -> int:
+    try:
+        workspace = initialize_workspace(root, workspace_path, overwrite=overwrite)
+        _print_json(
+            {
+                "status": "ok",
+                "workspace": str(workspace.root),
+                "pointer": str(workspace.pointer_path),
+                "directories": {
+                    "strategies": str(workspace.strategy_dir),
+                    "parquet": str(workspace.parquet_dir),
+                    "artifacts": str(workspace.latest_artifacts_dir),
+                    "database": str(workspace.db_path),
+                },
+                "git_sync": False,
+            }
+        )
+        return 0
+    except (WorkspaceError, OSError) as exc:
+        _print_json({"status": "blocked", "error": str(exc)})
+        return 2
 
 
 def _print_json(value) -> None:
@@ -206,11 +283,14 @@ def _run_backtest_command(
     run_mode: str,
     confirm_cost_profile: bool,
     confirm_position_sizing: bool,
+    project_root: Path,
+    data_provider=None,
 ) -> int:
     try:
         skill = require_a_stock_data_skill()
         payload = _read_json(strategy_path)
-        data = _read_json(data_path)
+        automatic_provenance = None
+        data = {} if data_path is None else _read_json(data_path)
         if not isinstance(data, dict):
             raise ValueError("回测数据必须是按标的代码分组的 JSON 对象")
         policy = dict(payload.get("data_policy") or {})
@@ -223,6 +303,21 @@ def _run_backtest_command(
         if not spec.is_valid:
             _print_json({"valid": False, "errors": list(spec.validation_errors)})
             return 2
+        if data_path is None:
+            start_date, end_date = resolve_strategy_window(spec)
+            provider = data_provider or build_historical_data_provider(project_root)
+            fetched = provider.fetch(spec.universe, start_date, end_date)
+            data = fetched.data
+            automatic_provenance = fetched.provenance
+            attach_data_provenance(payload, fetched)
+            spec = StrategySpec.from_dict(payload)
+            if not data:
+                raise ValueError(
+                    "Automatic historical data fetch failed; missing symbols: {}; errors: {}".format(
+                        ", ".join(fetched.missing_symbols) or "unknown",
+                        fetched.errors or "source returned no data",
+                    )
+                )
         if run_mode == "formal":
             if not confirm_cost_profile or not confirm_position_sizing:
                 _print_json({"status": "blocked", "error": "正式回测必须明确确认成本模板和仓位方案"})
@@ -231,6 +326,8 @@ def _run_backtest_command(
                 _print_json({"status": "blocked", "error": "正式回测必须提供带版本的成本模板"})
                 return 2
         result = BacktestEngine().run(spec, data)
+        if automatic_provenance:
+            result["provenance"].update(automatic_provenance)
         result["run_mode"] = run_mode
         record = store.save_backtest_run(spec, result)
         artifacts = write_backtest_artifacts(output_dir, result, int(record["id"]))
@@ -239,7 +336,7 @@ def _run_backtest_command(
     except AStockDataSkillError as exc:
         _print_json({"status": "blocked", "error": str(exc)})
         return 2
-    except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+    except (HistoricalDataError, OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
         _print_json({"status": "failed", "error": str(exc)})
         return 2
 

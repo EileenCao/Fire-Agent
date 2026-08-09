@@ -1,4 +1,5 @@
 from mcp_server.server import McpApplication, McpStdioServer, tool_definitions
+from mcp_server.services.historical_data import HistoricalDataResult
 from mcp_server.storage import SQLiteStore
 
 
@@ -36,6 +37,9 @@ def test_mcp_catalog_exposes_watchlist_and_notification_tools(tmp_path):
         "send_test_notification",
         "get_notification_status",
     }.issubset(names)
+    schemas = {tool["name"]: tool["inputSchema"] for tool in tool_definitions()}
+    assert "data" not in schemas["run_backtest"].get("required", [])
+    assert "data" not in schemas["prepare_backtest_data"].get("required", [])
 
 
 def test_mcp_watchlist_call_returns_structured_result(tmp_path):
@@ -95,6 +99,39 @@ def test_mcp_persists_backtest_result_and_exposes_evidence(tmp_path):
     assert loaded["structuredContent"]["result"]["provenance"]["source_version"] == "a-stock-data:3.6.0"
     assert compared["structuredContent"][0]["run_id"] == run_id
     assert evidence["structuredContent"]["run_id"] == run_id
+
+
+def test_mcp_fetches_data_when_run_backtest_data_is_omitted(tmp_path):
+    store = SQLiteStore(tmp_path / "research.sqlite3")
+    store.initialize()
+    data = {
+        "512890": [
+            {"date": "2026-01-01", "open": 10, "high": 10, "low": 10, "close": 10},
+            {"date": "2026-01-02", "open": 10, "high": 10, "low": 10, "close": 10},
+            {"date": "2026-01-03", "open": 10, "high": 10, "low": 10, "close": 10},
+            {"date": "2026-01-04", "open": 10, "high": 12, "low": 10, "close": 12},
+            {"date": "2026-01-05", "open": 20, "high": 20, "low": 18, "close": 18},
+        ]
+    }
+
+    class FakeProvider:
+        def fetch(self, codes, start_date, end_date):
+            return HistoricalDataResult(
+                data=data,
+                provenance={
+                    "source_name": "fake-a-stock-data",
+                    "source_version": "a-stock-data:3.6.0",
+                    "skill_name": "a-stock-data",
+                    "skill_version": "3.6.0",
+                    "price_basis": "adjusted",
+                },
+            )
+
+    app = McpApplication(store=store, historical_data_provider=FakeProvider())
+    result = app.call_tool("run_backtest", {"strategy": _strategy_payload()})
+
+    assert result["isError"] is False
+    assert result["structuredContent"]["result"]["provenance"]["source_name"] == "fake-a-stock-data"
 
 
 def test_mcp_stdio_initialize_and_tools_list_are_json_rpc_results(tmp_path):

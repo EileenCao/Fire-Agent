@@ -60,3 +60,13 @@ class ParquetDataCache:
             return pd.read_parquet(path).to_dict(orient="records")
         except (ImportError, ValueError, OSError) as exc:
             raise ParquetDataCacheError("读取 Parquet 失败：{}".format(exc)) from exc
+
+    def read_metadata(self, code: str, source_version: str) -> Dict[str, Any]:
+        path = self.path_for(code, source_version).with_suffix(".metadata.json")
+        if not path.exists():
+            return {}
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError) as exc:
+            raise ParquetDataCacheError("读取 Parquet 元数据失败：{}".format(exc)) from exc
+        return payload if isinstance(payload, dict) else {}

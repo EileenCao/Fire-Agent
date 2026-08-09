@@ -17,6 +17,9 @@ def _write_skill(path, version="3.6.0"):
 
 def test_cli_can_configure_and_list_a_local_watchlist(tmp_path, monkeypatch, capsys):
     monkeypatch.chdir(tmp_path)
+    workspace_path = tmp_path.parent / (tmp_path.name + "-FireAgentWorkspace")
+    assert main(["init", "--workspace", str(workspace_path)]) == 0
+    capsys.readouterr()
 
     assert main(["watchlist-add", "512890", "--instrument-type", "ETF"]) == 0
     output = capsys.readouterr().out

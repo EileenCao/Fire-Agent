@@ -1,6 +1,7 @@
 import json
 
 from mcp_server.cli import main
+from mcp_server.services.historical_data import HistoricalDataResult
 
 
 def _write_skill(path):
@@ -34,6 +35,13 @@ def _write_inputs(tmp_path):
     return strategy_path, data_path
 
 
+def _init_workspace(tmp_path, capsys):
+    workspace_path = tmp_path.parent / (tmp_path.name + "-FireAgentWorkspace")
+    assert main(["init", "--workspace", str(workspace_path)]) == 0
+    capsys.readouterr()
+    return workspace_path
+
+
 def test_cli_validates_strategy_file(tmp_path, monkeypatch, capsys):
     strategy_path, _ = _write_inputs(tmp_path)
 
@@ -48,6 +56,7 @@ def test_cli_runs_backtest_and_writes_local_artifacts(tmp_path, monkeypatch, cap
     _write_skill(skill_path)
     monkeypatch.setenv("A_STOCK_DATA_SKILL_PATH", str(skill_path))
     monkeypatch.chdir(tmp_path)
+    _init_workspace(tmp_path, capsys)
     strategy_path, data_path = _write_inputs(tmp_path)
     output_dir = tmp_path / "artifacts"
 
@@ -66,3 +75,96 @@ def test_cli_runs_backtest_and_writes_local_artifacts(tmp_path, monkeypatch, cap
     assert (output_dir / "result.json").exists()
     assert (output_dir / "report.md").exists()
     assert (output_dir / "trades.csv").exists()
+
+
+def test_cli_uses_default_strategy_path_when_strategy_is_omitted(tmp_path, monkeypatch, capsys):
+    skill_path = tmp_path / "skills" / "a-stock-data" / "SKILL.md"
+    _write_skill(skill_path)
+    monkeypatch.setenv("A_STOCK_DATA_SKILL_PATH", str(skill_path))
+    monkeypatch.chdir(tmp_path)
+    workspace_path = _init_workspace(tmp_path, capsys)
+    strategy_path, data_path = _write_inputs(tmp_path)
+    default_strategy_path = workspace_path / "strategies" / "strategy.json"
+    default_strategy_path.write_text(strategy_path.read_text(encoding="utf-8"), encoding="utf-8")
+    output_dir = tmp_path / "artifacts"
+
+    assert main([
+        "run-backtest",
+        "--data",
+        str(data_path),
+        "--output-dir",
+        str(output_dir),
+    ]) == 0
+
+    result = json.loads(capsys.readouterr().out)
+    assert result["run_id"] > 0
+
+
+def test_cli_uses_latest_artifacts_path_when_output_dir_is_omitted(tmp_path, monkeypatch, capsys):
+    skill_path = tmp_path / "skills" / "a-stock-data" / "SKILL.md"
+    _write_skill(skill_path)
+    monkeypatch.setenv("A_STOCK_DATA_SKILL_PATH", str(skill_path))
+    monkeypatch.chdir(tmp_path)
+    workspace_path = _init_workspace(tmp_path, capsys)
+    strategy_path, data_path = _write_inputs(tmp_path)
+
+    assert main([
+        "run-backtest",
+        "--strategy",
+        str(strategy_path),
+        "--data",
+        str(data_path),
+    ]) == 0
+
+    result = json.loads(capsys.readouterr().out)
+    assert result["run_id"] > 0
+    output_dir = workspace_path / "artifacts" / "latest"
+    assert (output_dir / "result.json").exists()
+    assert (output_dir / "report.md").exists()
+    assert (output_dir / "trades.csv").exists()
+
+
+def test_cli_fetches_data_automatically_into_the_user_workspace(
+    tmp_path, monkeypatch, capsys
+):
+    skill_path = tmp_path / "skills" / "a-stock-data" / "SKILL.md"
+    _write_skill(skill_path)
+    monkeypatch.setenv("A_STOCK_DATA_SKILL_PATH", str(skill_path))
+    monkeypatch.chdir(tmp_path)
+    workspace_path = tmp_path.parent / (tmp_path.name + "-FireAgentWorkspace")
+    assert main(["init", "--workspace", str(workspace_path)]) == 0
+    capsys.readouterr()
+
+    strategy = _write_inputs(tmp_path)[0].read_text(encoding="utf-8")
+    workspace_strategy = workspace_path / "strategies" / "strategy.json"
+    workspace_strategy.write_text(strategy, encoding="utf-8")
+
+    class FakeProvider:
+        def fetch(self, codes, start_date, end_date):
+            return HistoricalDataResult(
+                data={
+                    "512890": [
+                        {"date": "2026-01-01", "open": 10, "high": 10, "low": 10, "close": 10},
+                        {"date": "2026-01-02", "open": 10, "high": 10, "low": 10, "close": 10},
+                        {"date": "2026-01-03", "open": 10, "high": 10, "low": 10, "close": 10},
+                        {"date": "2026-01-04", "open": 10, "high": 12, "low": 10, "close": 12},
+                        {"date": "2026-01-05", "open": 20, "high": 20, "low": 18, "close": 18},
+                    ]
+                },
+                provenance={
+                    "source_name": "fake-a-stock-data",
+                    "source_url": "test://historical",
+                    "source_version": "a-stock-data:3.6.0",
+                    "skill_name": "a-stock-data",
+                    "skill_version": "3.6.0",
+                    "price_basis": "adjusted",
+                },
+            )
+
+    monkeypatch.setattr("mcp_server.cli.build_historical_data_provider", lambda root: FakeProvider())
+
+    assert main(["run-backtest"]) == 0
+
+    result = json.loads(capsys.readouterr().out)
+    assert result["result"]["provenance"]["source_name"] == "fake-a-stock-data"
+    assert (workspace_path / "artifacts" / "latest" / "result.json").exists()

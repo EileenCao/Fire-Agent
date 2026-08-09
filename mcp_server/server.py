@@ -9,10 +9,21 @@ from typing import Any, Dict, Iterable, Optional
 from mcp_server.calendar import TradingCalendar
 from mcp_server.dependencies import AStockDataSkillError, require_a_stock_data_skill
 from mcp_server.domain.strategy import StrategySpec
-from mcp_server.runtime import build_calendar, build_market_provider, build_notifier, build_store
+from mcp_server.runtime import (
+    build_calendar,
+    build_historical_data_provider,
+    build_market_provider,
+    build_notifier,
+    build_store,
+)
 from mcp_server.services.backtesting import BacktestEngine
 from mcp_server.services.observer import StrategyObserver
 from mcp_server.services.data_cache import ParquetDataCache
+from mcp_server.services.historical_data import (
+    HistoricalDataResult,
+    attach_data_provenance,
+    resolve_strategy_window,
+)
 from mcp_server.services.runner import DailyReportRunner
 
 
@@ -45,7 +56,7 @@ def tool_definitions() -> list:
                 "strategy": {"type": "object"},
                 "data": {"type": "object"},
             },
-            "required": ["strategy", "data"],
+            "required": ["strategy"],
         }),
         _tool("run_backtest", "运行确定性的日线策略回测", {
             "type": "object",
@@ -53,7 +64,7 @@ def tool_definitions() -> list:
                 "strategy": {"type": "object"},
                 "data": {"type": "object"},
             },
-            "required": ["strategy", "data"],
+            "required": ["strategy"],
         }),
         _tool("get_backtest_result", "读取已保存的回测结果", {
             "type": "object", "properties": {"run_id": {"type": "integer"}},
@@ -140,6 +151,7 @@ class McpApplication:
         calendar: Optional[TradingCalendar] = None,
         backtest_engine: Optional[BacktestEngine] = None,
         require_data_skill: bool = False,
+        historical_data_provider=None,
     ):
         self.store = store
         self.market_provider = market_provider
@@ -147,6 +159,7 @@ class McpApplication:
         self.calendar = calendar or TradingCalendar()
         self.backtest_engine = backtest_engine or BacktestEngine()
         self.require_data_skill = require_data_skill
+        self.historical_data_provider = historical_data_provider
 
     def call_tool(self, name: str, arguments: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         args = arguments or {}
@@ -210,6 +223,28 @@ class McpApplication:
         self.store.activate_strategy(args["strategy_id"], args["version"])
         return {"active": True, **args}
 
+    def _resolve_backtest_inputs(self, args):
+        payload = dict(args.get("strategy") or {})
+        if self.require_data_skill:
+            skill = require_a_stock_data_skill()
+            policy = dict(payload.get("data_policy") or {})
+            policy.setdefault("skill_name", skill.name)
+            policy.setdefault("skill_version", skill.version)
+            policy.setdefault("source_name", "a-stock-data")
+            policy.setdefault("source_version", "a-stock-data:{}".format(skill.version))
+            payload["data_policy"] = policy
+        spec = StrategySpec.from_dict(payload)
+        if not spec.is_valid:
+            raise ValueError("策略不可运行：{}".format("；".join(spec.validation_errors)))
+        if "data" in args and args["data"] is not None:
+            return spec, args["data"], None
+        if self.historical_data_provider is None:
+            raise RuntimeError("未配置历史数据 Provider；请先完成工作区和 a-stock-data 配置")
+        start_date, end_date = resolve_strategy_window(spec)
+        fetched = self.historical_data_provider.fetch(spec.universe, start_date, end_date)
+        attach_data_provenance(payload, fetched)
+        return StrategySpec.from_dict(payload), fetched.data, fetched
+
     def _prepare_backtest_data(self, args):
         payload = dict(args.get("strategy") or {})
         if self.require_data_skill:
@@ -223,7 +258,7 @@ class McpApplication:
         spec = StrategySpec.from_dict(payload)
         if not spec.is_valid:
             raise ValueError("策略不可运行：{}".format("；".join(spec.validation_errors)))
-        data = args.get("data") or {}
+        spec, data, fetched = self._resolve_backtest_inputs(args)
         missing = [code for code in spec.universe if code not in data]
         result = {
             "ready": not missing,
@@ -232,6 +267,10 @@ class McpApplication:
             "missing_symbols": missing,
             "source_version": spec.data_policy.get("source_version", "a-stock-data:unknown"),
         }
+        if fetched is not None:
+            result["provenance"] = fetched.provenance
+            result["errors"] = fetched.errors
+            result["cache_paths"] = dict(fetched.cache_paths)
         cache_dir = args.get("cache_dir")
         if cache_dir:
             cache = ParquetDataCache(cache_dir)
@@ -277,7 +316,10 @@ class McpApplication:
                 raise ValueError("正式回测必须明确确认成本模板和仓位方案")
             if not spec.cost_profile.get("template") or not spec.cost_profile.get("version"):
                 raise ValueError("正式回测必须提供带版本的成本模板")
-        result = self.backtest_engine.run(spec, args.get("data") or {})
+        spec, data, fetched = self._resolve_backtest_inputs(args)
+        result = self.backtest_engine.run(spec, data)
+        if fetched is not None:
+            result["provenance"].update(fetched.provenance)
         result["run_mode"] = run_mode
         record = self.store.save_backtest_run(spec, result)
         return {"run_id": record["id"], "result": result}
@@ -408,14 +450,16 @@ def run_stdio(application: McpApplication) -> None:
 
 
 def main() -> None:
-    store = build_store()
+    store = build_store(require_workspace=True)
     market_provider = build_market_provider()
+    historical_data_provider = build_historical_data_provider()
     application = McpApplication(
         store=store,
         market_provider=market_provider,
         notifier=build_notifier(),
-        calendar=build_calendar(),
+        calendar=build_calendar(require_workspace=True),
         require_data_skill=True,
+        historical_data_provider=historical_data_provider,
     )
     run_stdio(application)
 

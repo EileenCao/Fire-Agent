@@ -1,0 +1,13 @@
+[CmdletBinding()]
+param(
+    [Parameter(ValueFromRemainingArguments = $true)]
+    [string[]] $Arguments
+)
+
+$ErrorActionPreference = "Stop"
+$projectRoot = Split-Path -Parent $PSScriptRoot
+Set-Location -LiteralPath $projectRoot
+
+$python = if ($env:FIREAGENT_PYTHON) { $env:FIREAGENT_PYTHON } else { "python" }
+& $python -m mcp_server.cli sync @Arguments
+exit $LASTEXITCODE

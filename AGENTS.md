@@ -1,0 +1,14 @@
+# FireAgent project instructions
+
+Before handling a strategy, backtest, or daily-observation request in this project:
+
+1. Read the matching project Skill:
+   - `skills/strategy-workbench/SKILL.md` for clarifying and versioning a strategy.
+   - `skills/backtest-analysis/SKILL.md` for interpreting results and proposing experiments.
+   - `skills/daily-strategy-observer/SKILL.md` for daily rule signals and evidence.
+2. Require the installed `a-stock-data` Skill for real A-share data. It is a Skill with data-source rules and Python helpers, not a standalone MCP server.
+3. Use FireAgent MCP tools for deterministic validation, data preparation, backtesting, persistence, and evidence retrieval.
+4. Keep rule signals and AI observations separate. Do not run an unconfirmed formal experiment or place orders.
+5. Mark missing data, source time, source name, and Skill version instead of silently filling gaps.
+
+Run `python -m mcp_server.cli sync` after local code or Skill changes. It validates the project files and regenerates the ignored project-scoped Codex MCP configuration; it does not install or copy Skills globally.

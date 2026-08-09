@@ -73,6 +73,33 @@ MCP Server 是真正的业务执行层，负责调用数据接口、计算指标
 
 ## 4. 数据与持久化
 
+### 独立用户工作区与 Git 边界
+
+代码仓库与用户数据必须分离。首次使用时，Agent 先询问用户提供一个不在 FireAgent 仓库内的绝对路径，例如 `D:\FireAgentWorkspace`；用户确认后运行：
+
+```powershell
+python -m mcp_server.cli init --workspace "D:\FireAgentWorkspace"
+```
+
+项目只在仓库内保存被 Git 忽略的 `.fireagent\workspace.json` 指针。运行时路径解析优先使用环境变量 `FIREAGENT_WORKSPACE`，其次使用该指针；没有工作区时，面向用户的回测、MCP 和同步命令必须明确阻止并给出初始化命令。禁止在工作区执行 `git init`、`git add`、`git commit` 或远程同步。
+
+工作区目录固定为：
+
+```text
+<workspace>/
+├─ data/raw/                 # 原始数据快照
+├─ data/parquet/             # Parquet 日线缓存
+├─ data/trading_holidays.json
+├─ strategies/               # 默认 strategy.json
+├─ artifacts/latest/         # 探索性回测
+├─ artifacts/formal/         # 正式回测
+├─ reports/
+├─ logs/
+└─ stock_research.sqlite3
+```
+
+SQLite、策略文件、原始数据、Parquet、报告和日志均默认写入工作区；仓库内 `data/` 只允许保留测试夹具或占位文件，并通过 `.gitignore` 阻止本地运行数据进入 Git。
+
 ### 数据源
 
 优先使用 `a-stock-data` 已提供的接口和降级路径：
@@ -86,7 +113,7 @@ MCP 适配器不得把某一个源的字段格式泄露给上层。所有源先�
 
 ### SQLite 数据
 
-首版只使用本地 SQLite，数据库路径通过配置指定，默认放在项目数据目录之外或 `data/` 下并加入 `.gitignore`。建议保存：
+首版只使用本地 SQLite，数据库路径通过配置指定，默认放在用户确认的独立工作区根目录并加入 Git 隔离。建议保存：
 
 - `instruments`：代码、名称、市场、类型（股票/ETF）、标的指数。
 - `market_snapshots`：价格、成交、换手、交易日期和来源。
@@ -187,6 +214,8 @@ FireAgent/
 └─ .gitignore
 ```
 
+上面的仓库目录不承载用户运行数据。用户工作区由 `init --workspace` 创建并独立保存数据库、策略、原始数据、Parquet、报告和日志；`.fireagent\workspace.json` 只是被忽略的本地指针。
+
 ## 9. 实施阶段与验收标准
 
 ### 阶段一：研究内核
@@ -274,11 +303,19 @@ FireAgent/
 
 真实 A 股数据的唯一允许入口是已安装且版本满足要求的 `a-stock-data` Skill。启动检查支持 `A_STOCK_DATA_SKILL_PATH` 覆盖路径，默认检查 Codex、Agents 和 Claude Code 的用户 Skill 目录，并验证 frontmatter 中的名称和版本。`doctor`、生产 MCP 服务和真实数据回测启动时都执行检查；失败时返回安装依赖、路径和版本修复提示。
 
-项目当前保留一个腾讯行情适配器作为本地第一步，它只作为 MCP 边界的适配层，不能替代 Skill 的来源路由和备用源规则。后续接入历史 K 线、财务、研报、公告、ETF 估值等数据时，必须遵守 Skill 的通达信/腾讯优先、东财串行限流与会话复用、备用源降级和代码归一化规则。
+项目保留腾讯行情适配器作为 MCP 边界适配层，并通过历史 Provider 使用 Skill 认可的腾讯前复权日线线路；它不能替代 Skill 的来源路由和备用源规则。后续接入财务、研报、公告、ETF 估值等数据时，必须遵守 Skill 的通达信/腾讯优先、东财串行限流与会话复用、备用源降级和代码归一化规则。
 
 每个指标或数据快照都应记录：`source_name`、`source_url`、`source_version`、`skill_name`、`skill_version`、实际数据时间、采集时间、口径、状态和错误原因。真实回测的结果中必须保留 Skill 版本和数据来源；单元测试可以注入假数据 Provider，但不能用假数据绕过生产启动检查。
 
-历史日线快照使用可选的 Parquet 缓存，`prepare_backtest_data` 可以通过 `cache_dir` 写入；Parquet 引擎由本地环境提供。SQLite 只保存缓存的元数据、策略版本、运行记录和证据，不把完整历史行情塞进关系表。
+省略 `data` 调用 `prepare_backtest_data` 或 `run_backtest` 时，历史 Provider 根据策略验证窗口自动取数，原始响应写入工作区 `data/raw/`，标准化日线写入工作区 `data/parquet/`；Parquet 引擎由本地环境提供。SQLite 只保存缓存元数据、策略版本、运行记录和证据，不把完整历史行情塞进关系表。`cache_dir` 仍可用于显式指定缓存位置。
+
+### 本地 Agent 集成与同步边界
+
+`a-stock-data` 是 Agent Skill：它提供数据源规则和可执行的 Python 取数代码（包括历史 K 线调用），但本身不是一个运行中的 MCP Server，也不会出现在 FireAgent 的 `tools/list` 中。FireAgent 的历史 Provider 目前通过 Skill 认可的腾讯前复权日线线路自动取数，并保留来源、URL、请求区间、数据区间、复权口径和 Skill 版本；后续可在该 Provider 内增加通达信及其他已定义备用源，不改变 MCP 和回测引擎接口。
+
+项目提供 `python -m mcp_server.cli sync` 作为本地同步命令。它要求先完成 `init --workspace <用户确认路径>`，然后检查必需的 `a-stock-data` Skill、三个项目 Skill，并生成被 Git 忽略的 `.codex/config.toml`；配置中固定项目根目录、独立工作区、SQLite 和交易日历路径。它不会修改用户全局 Codex 配置，也不会重新安装 Skill。代码或 Skill 文档修改后再次运行该命令即可更新项目级配置和检查结果。若 MCP 进程已经启动，仍需重启 MCP 或新开任务以加载新的 Python 代码。
+
+Windows 主入口是本地忽略的 `scripts/sync.ps1`，Git Bash/WSL 可使用本地忽略的 `scripts/sync.sh`；仓库只保留不含本机路径的 `.example` 模板。同步脚本不能在 MCP stdio 进程启动前向 stdout 写诊断内容，MCP stdout 必须只承载 JSON-RPC。
 
 ## 15. 回测交易语义
 
@@ -329,4 +366,4 @@ AI 输出必须把“规则信号/回测事实”和“AI 观察/可选建议”
 
 当前本地里程碑包括：Skill 前置检查、SQLite 元数据、日线回测、交易约束、策略版本、证据链、三个 Skill、MCP stdio、CLI 产物、健康检查和 Feishu 默认关闭。验收重点是：周末/非交易日不产生正式日报、股票和 ETF 均可识别、无未来数据泄漏、T+1/涨跌停/停牌/交易单位/跳空/成本/复权/公司行动和止盈止损情景有测试、缺失不静默、插件被隔离、重复运行可复现。
 
-后续顺序为：更完整的历史数据和公司行动适配 → 更丰富的回测分析与实验管理 → 日观察长期运行 → 飞书或企业微信渠道 → Windows 任务计划 → 可迁移的云端调度。任何新增能力都不应破坏 Skill + MCP + SQLite 的边界。
+后续顺序为：更完整的历史数据和公司行动适配 → 更丰富的回测分析与实验管理 → 日观察长期运行 → 飞书或企业微信渠道 → Windows 任务计划 → 可迁移的云端调度。任何新增能力都不应破坏独立工作区和 Skill + MCP + SQLite 的边界。
