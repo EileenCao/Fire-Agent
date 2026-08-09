@@ -13,8 +13,12 @@ class TradingCalendar:
         holiday_file: Optional[Union[str, Path]] = None,
     ):
         self.holidays: Set[date] = set(holidays or ())
+        self._holiday_file = Path(holiday_file) if holiday_file else None
+        self._configured_file = bool(
+            self._holiday_file is not None and self._holiday_file.exists()
+        )
         if holiday_file:
-            self.holidays.update(_load_holidays(Path(holiday_file)))
+            self.holidays.update(_load_holidays(self._holiday_file))
         self._xshg = _load_xshg_calendar()
 
     @property
@@ -22,6 +26,11 @@ class TradingCalendar:
         if self._xshg is not None:
             return "exchange_calendars:XSHG"
         return "weekday_plus_configured_holidays"
+
+    @property
+    def is_authoritative(self) -> bool:
+        """Whether this instance has a source suitable for real scheduled sends."""
+        return self._xshg is not None or self._configured_file
 
     def is_trading_day(self, value: date) -> bool:
         if value.weekday() >= 5 or value in self.holidays:

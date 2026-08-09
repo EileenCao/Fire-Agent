@@ -85,6 +85,7 @@ def test_runner_is_idempotent_for_same_trading_day(tmp_path):
         market_provider=provider,
         notifier=notifier,
         calendar=TradingCalendar(),
+        now_fn=lambda: datetime(2026, 8, 10, 12, 3),
     )
 
     first = runner.run(date(2026, 8, 10))
@@ -121,3 +122,42 @@ def test_runner_waits_for_send_window_and_records_report_attempt(tmp_path):
     status = store.notification_status()
     assert status["latest_delivery"]["chunk_index"] == 0
     assert status["latest_delivery"]["chunk_count"] == 1
+
+
+def test_runner_reports_missing_notifier_as_delivery_failure(tmp_path):
+    store = SQLiteStore(tmp_path / "research.sqlite3")
+    store.initialize()
+    store.add_watchlist_item("512890", instrument_type="ETF")
+    runner = DailyReportRunner(
+        store=store,
+        market_provider=FakeMarketProvider(),
+        notifier=None,
+        calendar=TradingCalendar(),
+        now_fn=lambda: datetime(2026, 8, 10, 12, 3),
+    )
+
+    result = runner.run(date(2026, 8, 10), send=True)
+
+    assert result.status == "notification_not_configured"
+    assert store.get_report_run(
+        "daily_watchlist:2026-08-10:morning_close:{}".format(store.watchlist_version())
+    )["status"] == "delivery_failed"
+
+
+def test_runner_blocks_scheduled_send_without_authoritative_calendar(tmp_path, monkeypatch):
+    monkeypatch.setattr("mcp_server.calendar._load_xshg_calendar", lambda: None)
+    store = SQLiteStore(tmp_path / "research.sqlite3")
+    store.initialize()
+    store.add_watchlist_item("512890", instrument_type="ETF")
+    runner = DailyReportRunner(
+        store=store,
+        market_provider=FakeMarketProvider(),
+        notifier=FakeNotifier(),
+        calendar=TradingCalendar(),
+        require_authoritative_calendar=True,
+        now_fn=lambda: datetime(2026, 8, 10, 12, 3),
+    )
+
+    result = runner.run(date(2026, 8, 10), send=True)
+
+    assert result.status == "blocked_calendar_unavailable"

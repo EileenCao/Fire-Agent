@@ -3,6 +3,8 @@
 from typing import Any, Dict, Optional
 
 from mcp_server.services.backtesting import _normalize_data, _rules_match
+from mcp_server.services.indicators import build_indicator_series
+from mcp_server.services.signal_planner import build_signal_plan
 
 
 class StrategyObserver:
@@ -40,11 +42,8 @@ class StrategyObserver:
             latest = bars[-1]
             closes = [float(bar["close"]) for bar in bars]
             index = len(bars) - 1
-            entry = _rules_match(spec.entry, index, closes)
-            exit_ = _rules_match(spec.exit, index, closes)
-            held = _position_quantity(positions.get(code)) > 0
-            action = "SELL" if held and exit_ else "BUY" if not held and entry else "HOLD"
-            evidence = {
+            position_quantity = _position_quantity(positions.get(code))
+            base_evidence = {
                 "signal_date": str(latest["date"]),
                 "data_as_of": str(latest["date"]),
                 "source_name": spec.data_policy.get("source_name", "a-stock-data"),
@@ -54,21 +53,51 @@ class StrategyObserver:
                 ),
                 "skill_name": spec.data_policy.get("skill_name", "a-stock-data"),
                 "skill_version": spec.data_policy.get("skill_version"),
-                "rules": {
-                    "entry": spec.entry,
-                    "exit": spec.exit,
-                    "entry_match": entry,
-                    "exit_match": exit_,
-                },
-                "indicator_values": {"close": closes[-1]},
-                "position_quantity": _position_quantity(positions.get(code)),
                 "warnings": list(warnings),
             }
+            if spec.entry.get("mode") == "count_conditions":
+                indicator_series = build_indicator_series(spec, bars)
+                plan = build_signal_plan(
+                    spec,
+                    bars,
+                    index,
+                    int(position_quantity),
+                    indicator_series=indicator_series,
+                )
+                action = plan["action"]
+                if action == "SELL" and plan["sell_quantity"] <= 0:
+                    action = "HOLD"
+                evidence = dict(base_evidence)
+                evidence.update(plan["evidence"])
+                evidence["buy_cash"] = plan["buy_cash"]
+                evidence["sell_quantity"] = plan["sell_quantity"]
+                execution = (
+                    "same_trading_day_close" if action in {"BUY", "SELL"} else None
+                )
+            else:
+                entry = _rules_match(spec.entry, index, closes)
+                exit_ = _rules_match(spec.exit, index, closes)
+                held = position_quantity > 0
+                action = "SELL" if held and exit_ else "BUY" if not held and entry else "HOLD"
+                evidence = dict(base_evidence)
+                evidence.update(
+                    {
+                        "rules": {
+                            "entry": spec.entry,
+                            "exit": spec.exit,
+                            "entry_match": entry,
+                            "exit_match": exit_,
+                        },
+                        "indicator_values": {"close": closes[-1]},
+                        "position_quantity": position_quantity,
+                    }
+                )
+                execution = "next_trading_day_open" if action in {"BUY", "SELL"} else None
             signals.append(
                 {
                     "code": code,
                     "action": action,
-                    "execution": "next_trading_day_open" if action in {"BUY", "SELL"} else None,
+                    "execution": execution,
                     "status": "ok" if not warnings else "partial",
                     "evidence": evidence,
                 }

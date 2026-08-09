@@ -53,6 +53,7 @@ def test_sync_generates_project_scoped_codex_config(tmp_path, monkeypatch, capsy
     assert "FIREAGENT_WORKSPACE" in content
     assert json.dumps(str(workspace_path)) in content
     assert json.dumps(str(workspace_path / "stock_research.sqlite3")) in content
+    assert "FIREAGENT_ENABLE_FEISHU" not in content
 
 
 def test_sync_fails_without_required_skill(tmp_path, monkeypatch, capsys):

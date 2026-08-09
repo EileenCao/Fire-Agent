@@ -6,7 +6,7 @@ FireAgent 以 Agent 对话为入口，用三个 Skill 帮助用户澄清策略�
 
 项目根目录的 `AGENTS.md` 负责把对话任务路由到项目内的三个 Skill。Skill 文档修改后会在下一次 Agent 任务中按项目路径读取，不需要复制到 Codex 用户 Skill 目录。
 
-项目当前定位是本地研究工具：不自动下单，不连接券商交易接口；不需要 Ollama；首期不需要飞书或其他手机推送。
+项目当前定位是本地研究工具：不自动下单，不连接券商交易接口；不需要 Ollama；飞书仅作为可选的单向午间日报渠道，不支持飞书内双向 Agent 对话。
 
 ## 普通用户：Windows 快速开始
 
@@ -90,7 +90,7 @@ $env:IWENCAI_BASE_URL = "https://openapi.iwencai.com"
 
 取数时需要能访问 HTTP 数据接口；使用 `mootdx` 获取行情和历史 K 线时还需要网络允许通达信 TCP `7709` 端口。海外或受限网络可能导致通达信连接超时，`doctor` 通过不代表外部行情请求一定成功。
 
-真实数据功能不需要 `akshare`、Ollama、浏览器、券商客户端或飞书；飞书通知属于后续阶段。
+真实数据功能不需要 `akshare`、Ollama、浏览器或券商客户端。飞书通知默认关闭，启用时使用独立工作区 `config/.env` 和私人群自定义机器人 Webhook。
 
 来源与更新说明见 [`a-stock-data` GitHub 仓库](https://github.com/simonlin1212/a-stock-data)。项目启动时会检查 `SKILL.md` 的名称和最低版本（当前最低要求为 `3.6.0`）。也可以把 Skill 安装到 Claude Code 或 Agents 目录，或者显式指定路径：
 
@@ -119,6 +119,7 @@ python -m mcp_server.cli init --workspace "D:\FireAgentWorkspace"
 
 ```text
 <用户工作区>/
+├─ config/.env               # 可选：飞书 Webhook 和签名密钥，不进 Git
 ├─ data/raw/                 # 原始历史数据快照
 ├─ data/parquet/             # 可复用的 Parquet 日线缓存
 ├─ strategies/               # 默认策略文件 strategy.json
@@ -149,7 +150,7 @@ python -m mcp_server.cli doctor
 - 检查三个项目 Skill；
 - 生成项目级 `.codex/config.toml`；
 - 固定当前 Python、项目目录、独立工作区、数据库和交易日历路径；
-- 明确关闭 Feishu。
+- 不覆盖独立工作区中的 Feishu 配置；是否启用由工作区 `config/.env` 控制。
 
 ```powershell
 python -m mcp_server.cli sync
@@ -175,6 +176,37 @@ chmod +x scripts/sync.sh
 ### 5. 准备策略与数据
 
 策略文件是 JSON，至少要说明：策略 ID、版本、标的集合、日线频率、入场规则、出场规则、仓位方案。正式回测还要给出带版本的成本模板。建议把策略保存为工作区的 `strategies/strategy.json`，这样运行命令不需要写路径。
+
+需要持仓中继续投入或分批退出时，在 `position_sizing.while_holding` 中配置 `signal_add`、`periodic`，在 `exit.sell` 中配置 `all`、`percent` 或 `quantity`。`periodic.execution` 只能使用 `scheduled_open` 或 `next_open`；`strategy_configured` 不是可执行值。多标的策略还可以把 `position_sizing.capital_scope` 设置为 `per_symbol` 或 `portfolio`，并用 `action_priority` 指定同一执行日的 `SELL`、`PERIODIC_BUY`、`SIGNAL_BUY` 顺序。
+
+例如，下面的配置表示：持仓后每月 1 日按 1000 元新增资金定投，非交易日顺延到下一交易日开盘，普通出场卖出一半持仓：
+
+```json
+{
+  "position_sizing": {
+    "capital_scope": "per_symbol",
+    "type": "all_in",
+    "lot_size": 100,
+    "while_holding": {
+      "periodic": {
+        "enabled": true,
+        "frequency": "monthly",
+        "day": 1,
+        "type": "fixed_cash",
+        "amount": 1000,
+        "funding": "external_contribution",
+        "non_trading_day": "next_trading_day",
+        "execution": "scheduled_open"
+      }
+    }
+  },
+  "exit": {
+    "rules": [],
+    "sell": {"type": "percent", "value": 0.5}
+  },
+  "action_priority": ["SELL", "PERIODIC_BUY", "SIGNAL_BUY"]
+}
+```
 
 正常回测会根据 `validation.start_date` 和 `validation.end_date` 自动通过 `a-stock-data` 准备历史日线；未指定时默认使用最近四年至今天。数据会保存到工作区的 `data/raw/` 和 `data/parquet/`，结果写入 `artifacts/latest/`（正式模式写入 `artifacts/formal/`）。返回结果会标注来源、来源 URL、Skill 版本、复权口径、数据时间、缺失标的和错误。
 
@@ -284,14 +316,19 @@ python -m pytest -q
 
 ## 回测口径
 
-当前引擎固定采用以下语义：
+当前引擎采用以下交易语义：
 
-- 只做多，日线收盘产生信号，下一交易日开盘执行；
+- 只做多；普通规则信号默认在日线收盘产生、下一交易日开盘执行；周期定投可配置为计划日开盘或下一交易日开盘；
 - 默认股票和 ETF 每次按 100 股交易单位，可在策略仓位方案中覆盖；
-- T+1：买入当日不可卖出；停牌、涨停买入、跌停卖出和明确 `unfillable` 数据会产生 `UNFILLED` 记录；
+- 持仓按买入批次保存，按 FIFO 处理成本；T+1：买入当日不可卖出；
+- 支持持仓中再次触发入场信号加仓，以及 weekly/monthly/dates 周期定投；定投资金可来自新增资金或已有现金；
+- 普通出场规则支持全仓、百分比或固定数量卖出；固定数量超出可卖持仓时按可卖最大数量成交并告警；
+- `capital_scope=per_symbol` 使用标的独立资金，`capital_scope=portfolio` 使用共享组合现金池；
+- 同一执行日按 `action_priority` 处理 `SELL`、`PERIODIC_BUY`、`SIGNAL_BUY`；停牌、涨停买入、跌停卖出和明确 `unfillable` 数据会产生 `UNFILLED` 记录；
 - 跳空使用实际开盘价；止盈和止损同日同时触发时输出 `stop_first` 与 `take_first` 两个情景；
 - 可使用复权字段，复权口径和分红、公司行动分别保存；
 - 成本模板保存名称、版本、佣金、印花税、过户费、滑点和最低佣金；
+- 外部定投资金以现金流记录；存在外部现金流时，结果增加总投入资金、净利润和时间加权收益率，不把初始资金收益率作为唯一口径；
 - 缺失日线允许继续运行，但会在 JSON、Markdown 和 MCP 结果中明确标记；
 - 默认样本切分为 70/30，并记录 3 年训练、1 年测试滚动验证配置；
 - Python 策略插件必须先审阅批准，在独立进程中运行，使用依赖白名单、超时和网络隔离。
@@ -324,7 +361,7 @@ FireAgent/
    │  └─ strategy.py                  # StrategySpec 与版本契约
    ├─ adapters/
    │  ├─ a_stock_data.py             # a-stock-data 行情适配层
-   │  └─ feishu.py                   # 后续渠道适配器，默认关闭
+   │  └─ feishu.py                   # 飞书 Webhook 适配器，默认关闭
    ├─ services/
    │  ├─ backtesting.py               # 确定性回测引擎
    │  ├─ historical_data.py           # a-stock-data 历史日线 Provider 与缓存
@@ -360,7 +397,7 @@ FireAgent/
 - 新数据源：实现适配器，统一来源、时间和缺失字段，保留 a-stock-data 的限流与降级策略；
 - 新策略指标：先增加确定性规则和回归测试，不能让 AI 直接改写历史结果；
 - 新 Python 插件：必须经过用户审阅批准，使用 `PythonStrategyPluginRunner` 的白名单、超时和无网络进程；
-- 新手机渠道：实现渠道适配器，不改变日报和研究逻辑。飞书、企业微信和 Windows 任务计划属于后续阶段。
+- 新手机渠道：实现渠道适配器，不改变日报和研究逻辑。飞书单向定时推送已实现；飞书双向 Agent、企业微信和云端任务属于后续阶段。
 
 ## 故障排查
 
@@ -391,8 +428,31 @@ PowerShell 不能直接执行 `.sh`。请使用 Git Bash 或 WSL，或者改用�
 
 ### 如何启用通知
 
-首期不启用飞书，正常本地回测不需要任何 Webhook。飞书 Webhook、签名安全、限流拆分和 Windows 交易日调度将在本地回测验收后单独讨论和启用。
+飞书默认关闭，正常本地回测不需要任何 Webhook。启用时，把配置放在独立工作区的 `config/.env`，不要写入仓库、SQLite 或日志：
+
+```dotenv
+FIREAGENT_ENABLE_FEISHU=1
+FEISHU_WEBHOOK_URL=https://open.feishu.cn/open-apis/bot/v2/hook/替换为你的地址
+FEISHU_WEBHOOK_SECRET=替换为你的签名密钥
+FEISHU_MAX_PAYLOAD_BYTES=18432
+```
+
+先查看状态（不发送消息），再发送明确标记的测试消息：
+
+```powershell
+python -m mcp_server.cli notification-status
+python -m mcp_server.cli notification-test --message "FireAgent 通知测试"
+```
+
+交易日午间日报由 Windows 任务计划程序每天 12:00 唤醒，程序设置为项目 Python，参数为 `-m mcp_server.cli daily-report --send`，工作目录为 FireAgent 项目根目录。运行器自行检查 A 股交易日历，并在配置的 12:03–12:05 窗口发送；非交易日只记录跳过，不推送。手工试跑或预览可以使用：
+
+```powershell
+python -m mcp_server.cli preview --report-date YYYY-MM-DD
+python -m mcp_server.cli daily-report --send
+```
+
+自定义机器人请求体不能超过 20 KB，适配器默认按 18 KiB 安全阈值拆分并重试；Webhook 签名和错误信息会脱敏。当前方案是单向定时推送，不支持在飞书里与 Agent 双向对话；双向对话需要后续接入飞书应用机器人和消息事件桥接。完整手工任务计划和故障排查见 [`docs/feishu-scheduled-notification-design.md`](docs/feishu-scheduled-notification-design.md)。
 
 ## 设计文档与路线
 
-完整的边界、数据模型、MCP 接口、策略回测语义、证据链和后续通知设计见 [`docs/stock-research-system-design.md`](docs/stock-research-system-design.md)。当前路线是：本地依赖检查与回测闭环 → 日维度观察与分析建议 → 数据缓存和更完整的复权/公司行动 → 通知渠道与定时器 → 云端迁移。
+完整的边界、数据模型、MCP 接口、策略回测语义和证据链见 [`docs/stock-research-system-design.md`](docs/stock-research-system-design.md)；飞书午间推送的实现细节见 [`docs/feishu-scheduled-notification-design.md`](docs/feishu-scheduled-notification-design.md)。当前路线是：本地依赖检查与回测闭环 → 日维度观察与分析建议 → 飞书单向定时推送 → 更丰富的渠道与云端调度。

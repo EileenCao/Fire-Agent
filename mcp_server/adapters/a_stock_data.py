@@ -69,7 +69,10 @@ class TencentMarketDataProvider:
         self.skill = skill
 
     def snapshots_for(
-        self, items: Iterable[WatchlistItem], cutoff: str
+        self,
+        items: Iterable[WatchlistItem],
+        cutoff: str,
+        report_date=None,
     ) -> list:
         watchlist = list(items)
         if not watchlist:
@@ -93,6 +96,26 @@ class TencentMarketDataProvider:
             as_of = _parse_quote_time(quote.get("quote_time"))
             if as_of is None:
                 warnings.append("行情接口未返回明确报价时间")
+                if report_date is not None:
+                    snapshots.append(
+                        _missing_snapshot(
+                            item,
+                            "行情接口未返回明确报价时间，已拒绝混入午间报告",
+                            self.skill,
+                        )
+                    )
+                    continue
+            if report_date is not None and as_of is not None and as_of.date() != report_date:
+                snapshots.append(
+                    _missing_snapshot(
+                        item,
+                        "报价日期 {} 与报告日期 {} 不一致，已拒绝混入午间报告".format(
+                            as_of.date().isoformat(), report_date.isoformat()
+                        ),
+                        self.skill,
+                    )
+                )
+                continue
             cutoff_time = _parse_cutoff_time(cutoff)
             if as_of is not None and cutoff_time is not None and as_of.time() > cutoff_time:
                 snapshots.append(

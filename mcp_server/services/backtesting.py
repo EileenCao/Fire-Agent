@@ -26,6 +26,7 @@ class PositionLot:
     price: float
     cost: float
     source: str
+    fees: float = 0.0
 
 
 @dataclass
@@ -75,8 +76,10 @@ class PositionBook:
             sold = min(lot.quantity, remaining)
             unit_cost = lot.cost / lot.quantity
             allocated_cost = unit_cost * sold
+            allocated_fees = (lot.fees / lot.quantity) * sold
             lot.quantity -= sold
             lot.cost -= allocated_cost
+            lot.fees -= allocated_fees
             remaining -= sold
             allocations.append((lot.lot_id, sold, allocated_cost))
         self.lots = [lot for lot in self.lots if lot.quantity > 0]
@@ -96,6 +99,8 @@ class PendingOrder:
     amount: Optional[float] = None
     funding: str = "existing_cash"
     intraday_price: Optional[float] = None
+    priority: Optional[int] = None
+    evidence: Optional[Dict[str, Any]] = None
 
 
 class BacktestEngine:
@@ -163,7 +168,14 @@ class BacktestEngine:
         if not total_equity:
             total_equity = {"": spec.initial_capital}
         values = [total_equity[key] for key in sorted(total_equity)]
-        metrics = _metrics(spec.initial_capital, total_equity, values, all_trades, cash_flows)
+        metrics = _metrics(
+            spec.initial_capital,
+            total_equity,
+            values,
+            all_trades,
+            cash_flows,
+            positions,
+        )
         return {
             "scenario": scenario,
             "equity_curve": total_equity,
@@ -458,6 +470,11 @@ class BacktestEngine:
         event_maps = {code: _periodic_events(spec, bars_by_code[code]) for code in codes}
         indices = {code: 0 for code in codes}
         order_number = 0
+        close_execution = _uses_close_execution(spec)
+        indicator_series = {
+            code: build_indicator_series(spec, bars_by_code[code])
+            for code in codes
+        } if close_execution else {}
 
         for day in dates:
             eligible_periodic = []
@@ -548,10 +565,57 @@ class BacktestEngine:
                 if suspended:
                     warnings.append("{} {} 停牌，无法产生或执行交易".format(code, day))
                     continue
+                next_day = _next_date(sorted(maps[code]), day)
+                if close_execution:
+                    plan = build_signal_plan(
+                        spec,
+                        bars_by_code[code],
+                        index,
+                        book.total_quantity(),
+                        indicator_series=indicator_series[code],
+                    )
+                    if plan["action"] in {"BUY", "SELL"}:
+                        order_number += 1
+                        action = plan["action"]
+                        trade, cash, flow, order_warnings = self._execute_order(
+                            spec,
+                            code,
+                            bar,
+                            PendingOrder(
+                                code=code,
+                                side=action,
+                                source="SIGNAL_BUY" if action == "BUY" else "SELL",
+                                signal_date=day,
+                                execute_date=day,
+                                reason=plan.get("evidence", {}).get("reason", "SIGNAL"),
+                                config={
+                                    "type": "recurrent_cash",
+                                    "amount": plan["buy_cash"],
+                                    "lot_size": _lot_size(spec),
+                                    "cost_basis": "weighted_average",
+                                },
+                                requested_quantity=(
+                                    plan["sell_quantity"] if action == "SELL" else None
+                                ),
+                                intraday_price=float(bar["close"]),
+                                evidence=plan["evidence"],
+                            ),
+                            book,
+                            cash,
+                            spec.initial_capital,
+                            _lot_size(spec),
+                            next_day,
+                            order_number,
+                        )
+                        trades.append(trade)
+                        if flow:
+                            cash_flows.append(flow)
+                        warnings.extend(order_warnings)
+                    continue
+
                 closes = [float(item["close"]) for item in bars_by_code[code][:index + 1]]
                 entry_match = _rules_match(spec.entry, index, closes)
                 exit_match = _rules_match(spec.exit, index, closes)
-                next_day = _next_date(sorted(maps[code]), day)
                 if book.total_quantity() == 0 and entry_match and next_day:
                     _queue_next_order(
                         pending,
@@ -607,7 +671,14 @@ class BacktestEngine:
             "trades": trades,
             "cash_flows": cash_flows,
             "positions": {code: _position_snapshot(book) for code, book in books.items()},
-            "metrics": _metrics(spec.initial_capital, equity_curve, list(equity_curve.values()), trades, cash_flows),
+            "metrics": _metrics(
+                spec.initial_capital,
+                equity_curve,
+                list(equity_curve.values()),
+                trades,
+                cash_flows,
+                {code: _position_snapshot(book) for code, book in books.items()},
+            ),
             "warnings": sorted(set(warnings)),
         }
 
@@ -631,7 +702,7 @@ class BacktestEngine:
         flow = None
         warnings = []
         order_config = order.config or {}
-        signal_evidence = order_config.get("signal_evidence")
+        signal_evidence = order.evidence or order_config.get("signal_evidence")
         if order.funding == "external_contribution":
             amount = _as_float(order.amount)
             if amount and amount > 0:
@@ -650,6 +721,16 @@ class BacktestEngine:
         requested_sell = order.requested_quantity
         if order.side == "SELL" and requested_sell is None:
             requested_sell = _sell_quantity(spec, book, day, lot_size)
+        requested_buy = order.requested_quantity
+        if order.side == "BUY" and requested_buy is None:
+            config = order_config or dict(spec.position_sizing or {})
+            requested_buy = _buy_requested_quantity(config, lot_size)
+            if requested_buy is None:
+                fill_price = raw_price * (1 + float(rates["slippage_rate"]))
+                target_cash = _buy_target_cash(config, cash, allocation)
+                requested_buy = floor(
+                    max(0.0, target_cash) / fill_price / lot_size
+                ) * lot_size if fill_price > 0 else 0
         if blocked:
             return (
                 _unfilled_trade(
@@ -658,14 +739,14 @@ class BacktestEngine:
                     day,
                     order.signal_date,
                     raw_price,
-                    requested_sell if order.side == "SELL" else order.requested_quantity or 0,
+                    requested_sell if order.side == "SELL" else requested_buy or 0,
                     "{}；订单未成交".format(blocked),
                     order_id=order_id,
                     source=order.source,
                     requested_quantity=(
                         requested_sell
                         if order.side == "SELL"
-                        else order.requested_quantity
+                        else requested_buy
                     ),
                     position_before=position_before,
                     position_after=position_before,
@@ -680,7 +761,7 @@ class BacktestEngine:
 
         if order.side == "BUY":
             config = order_config or dict(spec.position_sizing or {})
-            requested = _buy_requested_quantity(config, lot_size)
+            requested = requested_buy
             fill_price = raw_price * (1 + float(rates["slippage_rate"]))
             target_cash = _buy_target_cash(config, cash, allocation)
             max_quantity = _affordable_quantity(rates, fill_price, cash, lot_size)
@@ -758,6 +839,7 @@ class BacktestEngine:
                     price=fill_price,
                     cost=total,
                     source=order.source,
+                    fees=fee,
                 )
             )
             status = "PARTIAL" if requested is not None and target_quantity < requested else "FILLED"
@@ -1013,8 +1095,20 @@ def _queue_next_order(pending, order):
 
 
 def _order_sort_key(spec, order, code_index):
-    priority = list(spec.action_priority or [])
+    priority = [
+        {"EXIT": "SELL", "ENTRY": "SIGNAL_BUY"}.get(
+            str(value).upper(), str(value).upper()
+        )
+        for value in (spec.action_priority or [])
+    ]
+    if order.priority is not None:
+        try:
+            rank = int(order.priority)
+        except (TypeError, ValueError):
+            rank = len(priority)
+        return rank, code_index, order.signal_date, order.source
     action = order.source if order.source in {"PERIODIC_BUY", "SIGNAL_BUY"} else order.side
+    action = {"EXIT": "SELL", "ENTRY": "SIGNAL_BUY"}.get(action, action)
     try:
         rank = priority.index(action)
     except ValueError:
@@ -1036,6 +1130,7 @@ def _position_snapshot(book):
             "quantity": lot.quantity,
             "price": round(lot.price, 8),
             "cost": round(lot.cost, 8),
+            "fees": round(lot.fees, 8),
             "source": lot.source,
         }
         for lot in book.lots
@@ -1156,6 +1251,7 @@ def _metrics(
     values: List[float],
     trades: List[Dict[str, Any]],
     cash_flows: Optional[List[Dict[str, Any]]] = None,
+    positions: Optional[Dict[str, List[Dict[str, Any]]]] = None,
 ):
     final = values[-1] if values else initial
     peak = initial
@@ -1185,6 +1281,7 @@ def _metrics(
         if trade.get("side") == "SELL" and trade.get("status") != "UNFILLED"
     ]
     wins = [trade for trade in completed if trade.get("pnl", 0) > 0]
+    position_metrics = _position_metrics(positions, max(equity_curve) if equity_curve else None)
     return {
         "initial_capital": initial,
         "final_equity": round(final, 8),
@@ -1196,6 +1293,27 @@ def _metrics(
         "max_drawdown": round(max_drawdown, 8),
         "trade_count": len(completed),
         "win_rate": round(len(wins) / len(completed), 8) if completed else None,
+        **position_metrics,
+    }
+
+
+def _position_metrics(positions, as_of):
+    lots = []
+    for code, code_lots in (positions or {}).items():
+        for raw_lot in code_lots or []:
+            lot = dict(raw_lot)
+            lot.setdefault("code", code)
+            lots.append(lot)
+    quantity = sum(max(0, int(lot.get("quantity", 0))) for lot in lots)
+    available = sum(
+        max(0, int(lot.get("quantity", 0)))
+        for lot in lots
+        if as_of is not None and str(lot.get("available_date", "9999-12-31")) <= str(as_of)
+    )
+    return {
+        "current_position_lots": lots,
+        "current_position_quantity": quantity,
+        "current_available_quantity": available,
     }
 
 
@@ -1300,6 +1418,9 @@ def _unfilled_trade(
         "signal_date": signal_date,
         "price": round(price, 8),
         "quantity": quantity,
+        "requested_quantity": quantity,
+        "filled_quantity": 0,
+        "lot_ids": [],
         "status": "UNFILLED",
         "reason": reason,
     }

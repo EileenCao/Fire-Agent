@@ -388,7 +388,7 @@ class McpApplication:
             send_end=_parse_time(args.get("send_end", "12:05")),
             trading_days_only=args.get("trading_days_only", True),
         )
-        return {"schedule": asdict(schedule)}
+        return {"schedule": _schedule_payload(schedule)}
 
     def _send_test_notification(self, args):
         if self.notifier is None:
@@ -400,7 +400,8 @@ class McpApplication:
     def _get_notification_status(self, args):
         value = self.store.notification_status()
         value["webhook_configured"] = self.notifier is not None
-        value["schedule"] = asdict(self.store.get_daily_report_schedule())
+        value["schedule"] = _schedule_payload(self.store.get_daily_report_schedule())
+        value["network_send_performed"] = False
         return value
 
 
@@ -501,6 +502,13 @@ def _parse_date(value: Optional[str]):
 
 def _parse_time(value: str) -> time:
     return time.fromisoformat(value)
+
+
+def _schedule_payload(schedule) -> Dict[str, Any]:
+    payload = asdict(schedule)
+    for key in ("wake_time", "send_start", "send_end"):
+        payload[key] = payload[key].isoformat(timespec="minutes")
+    return payload
 
 
 if __name__ == "__main__":

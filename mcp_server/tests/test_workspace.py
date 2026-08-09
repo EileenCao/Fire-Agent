@@ -4,7 +4,7 @@ from datetime import date
 import pytest
 
 from mcp_server.cli import main
-from mcp_server.runtime import build_calendar, build_store
+from mcp_server.runtime import build_calendar, build_store, load_local_env
 from mcp_server.workspace import WorkspaceError, initialize_workspace, load_workspace
 
 
@@ -85,3 +85,27 @@ def test_runtime_defaults_follow_the_independent_workspace(tmp_path, monkeypatch
 
     assert store.path == workspace.db_path
     assert date(2026, 1, 1) in calendar.holidays
+
+
+def test_runtime_loads_notification_secrets_from_workspace_config(tmp_path, monkeypatch):
+    project_root = tmp_path / "FireAgent"
+    project_root.mkdir()
+    workspace = initialize_workspace(project_root, tmp_path / "FireAgentWorkspace")
+    workspace.env_path.write_text(
+        "FIREAGENT_ENABLE_FEISHU=1\n"
+        "FEISHU_WEBHOOK_URL=https://open.feishu.cn/open-apis/bot/v2/hook/test\n"
+        "FEISHU_WEBHOOK_SECRET=workspace-secret\n",
+        encoding="utf-8",
+    )
+    for key in (
+        "FIREAGENT_ENABLE_FEISHU",
+        "FEISHU_WEBHOOK_URL",
+        "FEISHU_WEBHOOK_SECRET",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+    load_local_env(project_root)
+
+    assert __import__("os").environ["FIREAGENT_ENABLE_FEISHU"] == "1"
+    assert __import__("os").environ["FEISHU_WEBHOOK_URL"].endswith("/test")
+    assert __import__("os").environ["FEISHU_WEBHOOK_SECRET"] == "workspace-secret"

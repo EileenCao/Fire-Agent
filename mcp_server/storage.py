@@ -6,6 +6,7 @@ import sqlite3
 from datetime import date, time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Union
+from zoneinfo import ZoneInfo
 
 from mcp_server.domain.identifiers import normalize_ticker
 from mcp_server.domain.models import DailyReportSchedule, WatchlistItem
@@ -79,6 +80,9 @@ class SQLiteStore:
                     run_id INTEGER NOT NULL,
                     channel_id TEXT NOT NULL,
                     attempt INTEGER NOT NULL,
+                    chunk_index INTEGER NOT NULL DEFAULT 0,
+                    chunk_count INTEGER NOT NULL DEFAULT 1,
+                    content_format TEXT NOT NULL DEFAULT 'text',
                     status TEXT NOT NULL,
                     response_code INTEGER,
                     error TEXT,
@@ -126,6 +130,9 @@ class SQLiteStore:
                 );
                 """
             )
+            _ensure_column(connection, "delivery_attempts", "chunk_index", "INTEGER NOT NULL DEFAULT 0")
+            _ensure_column(connection, "delivery_attempts", "chunk_count", "INTEGER NOT NULL DEFAULT 1")
+            _ensure_column(connection, "delivery_attempts", "content_format", "TEXT NOT NULL DEFAULT 'text'")
 
     def save_strategy_version(
         self, spec: StrategySpec, status: str = "draft"
@@ -405,6 +412,12 @@ class SQLiteStore:
         send_end: time = time(12, 5),
         trading_days_only: bool = True,
     ) -> DailyReportSchedule:
+        try:
+            ZoneInfo(timezone)
+        except Exception as exc:
+            raise ValueError("日报时区无效：{}".format(timezone)) from exc
+        if send_start > send_end or wake_time > send_start:
+            raise ValueError("日报发送窗口必须晚于唤醒时间且起点不能晚于终点")
         schedule = DailyReportSchedule(
             enabled=enabled,
             timezone=timezone,
@@ -523,12 +536,85 @@ class SQLiteStore:
         run_id: int,
         status: str,
         error: Optional[str] = None,
+        data_as_of: Optional[str] = None,
+        content: Optional[str] = None,
     ) -> None:
         with self._connect() as connection:
             connection.execute(
-                "UPDATE report_runs SET status = ?, error = ?, updated_at = ? WHERE id = ?",
-                (status, error, _utc_now(), run_id),
+                """
+                UPDATE report_runs
+                SET status = ?, error = ?, data_as_of = COALESCE(?, data_as_of),
+                    content = COALESCE(?, content),
+                    content_hash = CASE WHEN ? IS NULL THEN content_hash
+                                       ELSE ? END,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    status,
+                    error,
+                    data_as_of,
+                    content,
+                    content,
+                    hashlib.sha256(content.encode("utf-8")).hexdigest()
+                    if content is not None
+                    else None,
+                    _utc_now(),
+                    run_id,
+                ),
             )
+
+    def claim_report_run(
+        self,
+        idempotency_key: str,
+        report_date: date,
+        session: str,
+        lease_seconds: int = 600,
+    ) -> Dict[str, Any]:
+        """Atomically claim a report run, allowing stale crashed runs to recover."""
+
+        timestamp = _utc_now()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM report_runs WHERE idempotency_key = ?",
+                (idempotency_key,),
+            ).fetchone()
+            if row is None:
+                connection.execute(
+                    """
+                    INSERT INTO report_runs
+                        (idempotency_key, report_date, session, status, created_at, updated_at)
+                    VALUES (?, ?, ?, 'running', ?, ?)
+                    """,
+                    (idempotency_key, report_date.isoformat(), session, timestamp, timestamp),
+                )
+                claimed = True
+            else:
+                existing = dict(row)
+                if existing["status"] == "sent":
+                    claimed = False
+                elif existing["status"] == "running" and not _is_stale(
+                    existing.get("updated_at"), lease_seconds
+                ):
+                    claimed = False
+                else:
+                    connection.execute(
+                        """
+                        UPDATE report_runs
+                        SET status = 'running', error = NULL, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (timestamp, existing["id"]),
+                    )
+                    claimed = True
+            current = connection.execute(
+                "SELECT * FROM report_runs WHERE idempotency_key = ?",
+                (idempotency_key,),
+            ).fetchone()
+        result = dict(current)
+        result["claimed"] = claimed
+        return result
 
     def get_report_run(self, idempotency_key: str) -> Optional[Dict[str, Any]]:
         with self._connect() as connection:
@@ -546,15 +632,30 @@ class SQLiteStore:
         status: str,
         response_code: Optional[int] = None,
         error: Optional[str] = None,
+        chunk_index: int = 0,
+        chunk_count: int = 1,
+        content_format: str = "text",
     ) -> None:
         with self._connect() as connection:
             connection.execute(
                 """
                 INSERT INTO delivery_attempts
-                    (run_id, channel_id, attempt, status, response_code, error, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                    (run_id, channel_id, attempt, chunk_index, chunk_count,
+                     content_format, status, response_code, error, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (run_id, channel_id, attempt, status, response_code, error, _utc_now()),
+                (
+                    run_id,
+                    channel_id,
+                    attempt,
+                    chunk_index,
+                    chunk_count,
+                    content_format,
+                    status,
+                    response_code,
+                    error,
+                    _utc_now(),
+                ),
             )
 
     def notification_status(self) -> Dict[str, Any]:
@@ -594,6 +695,31 @@ def _utc_now() -> str:
     from datetime import datetime, timezone
 
     return datetime.now(timezone.utc).isoformat()
+
+
+def _ensure_column(connection: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+    columns = {
+        row[1]
+        for row in connection.execute("PRAGMA table_info({})".format(table)).fetchall()
+    }
+    if column not in columns:
+        connection.execute(
+            "ALTER TABLE {} ADD COLUMN {} {}".format(table, column, definition)
+        )
+
+
+def _is_stale(value: Optional[str], lease_seconds: int) -> bool:
+    from datetime import datetime, timedelta, timezone
+
+    if not value:
+        return True
+    try:
+        updated = datetime.fromisoformat(value)
+    except ValueError:
+        return True
+    if updated.tzinfo is None:
+        updated = updated.replace(tzinfo=timezone.utc)
+    return datetime.now(timezone.utc) - updated > timedelta(seconds=lease_seconds)
 
 
 def _watchlist_from_row(row: sqlite3.Row) -> WatchlistItem:

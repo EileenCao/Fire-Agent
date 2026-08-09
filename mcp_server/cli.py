@@ -79,6 +79,26 @@ def main(argv=None) -> int:
         )
         _print_json(asdict(schedule))
         return 0
+    if args.command == "notification-status":
+        value = store.notification_status()
+        value["webhook_configured"] = build_notifier() is not None
+        value["schedule"] = asdict(store.get_daily_report_schedule())
+        value["network_send_performed"] = False
+        _print_json(value)
+        return 0
+    if args.command == "notification-test":
+        notifier = build_notifier()
+        if notifier is None:
+            _print_json(
+                {
+                    "status": "blocked",
+                    "error": "未配置 Feishu；请在独立工作区 config/.env 设置 FEISHU_WEBHOOK_URL",
+                }
+            )
+            return 2
+        result = notifier.send_markdown(args.message or "FireAgent 飞书通知测试")
+        _print_json({"status": "sent" if result.success else "failed", "delivery": asdict(result)})
+        return 0 if result.success else 3
     if args.command == "run-backtest":
         strategy_path = Path(args.strategy) if args.strategy else workspace.strategy_path
         data_path = Path(args.data) if args.data else None
@@ -100,8 +120,9 @@ def main(argv=None) -> int:
             project_root=root,
         )
     if args.command in {"preview", "daily-report"}:
-        notifier = build_notifier() if args.send else None
-        if args.send and notifier is None:
+        should_send = args.command == "daily-report" and args.send
+        notifier = build_notifier() if should_send else None
+        if should_send and notifier is None:
             print("未启用或未配置 Feishu；本地验证请使用 preview（默认不发送）。", file=sys.stderr)
             return 2
         runner = DailyReportRunner(
@@ -109,16 +130,24 @@ def main(argv=None) -> int:
             market_provider=build_market_provider(root),
             notifier=notifier,
             calendar=build_calendar(root, require_workspace=True),
+            require_authoritative_calendar=should_send,
         )
         result = runner.run(
-            date.fromisoformat(args.report_date) if args.report_date else date.today(),
-            send=args.send,
+            date.fromisoformat(args.report_date) if args.report_date else None,
+            send=should_send,
         )
         if result.status == "previewed":
             print(result.message)
         else:
             _print_json({"status": result.status, "report_id": result.report_id, "message": result.message})
-        return 0 if result.status not in {"delivery_failed"} else 3
+        return 0 if result.status not in {
+            "delivery_failed",
+            "missed_window",
+            "blocked_invalid_schedule",
+            "blocked_invalid_timezone",
+            "blocked_report_date",
+            "blocked_calendar_unavailable",
+        } else 3
     parser.error("未知命令")
     return 2
 
@@ -154,6 +183,10 @@ def _parser():
     configure.add_argument("--disabled", action="store_true")
     configure.add_argument("--include-non-trading-days", action="store_true")
 
+    subparsers.add_parser("notification-status", help="查看通知配置和最近投递状态，不发送消息")
+    test_notification = subparsers.add_parser("notification-test", help="发送一条明确标记的飞书测试消息")
+    test_notification.add_argument("--message")
+
     validate = subparsers.add_parser("validate-strategy", help="验证策略文件")
     validate.add_argument("--file", required=True)
 
@@ -165,10 +198,11 @@ def _parser():
     run.add_argument("--confirm-cost-profile", action="store_true")
     run.add_argument("--confirm-position-sizing", action="store_true")
 
-    for name in ("preview", "daily-report"):
-        command = subparsers.add_parser(name, help="生成午间观察日报")
-        command.add_argument("--report-date", help="YYYY-MM-DD，默认今天")
-        command.add_argument("--send", action="store_true", help="显式启用通知发送")
+    preview = subparsers.add_parser("preview", help="生成但不发送午间观察日报")
+    preview.add_argument("--report-date", help="YYYY-MM-DD，默认今天")
+    daily = subparsers.add_parser("daily-report", help="生成并可发送午间观察日报")
+    daily.add_argument("--report-date", help="YYYY-MM-DD，默认今天")
+    daily.add_argument("--send", action="store_true", help="显式启用通知发送")
     return parser
 
 
@@ -241,6 +275,7 @@ def _init_workspace(root: Path, workspace_path: Path, overwrite: bool) -> int:
                 "pointer": str(workspace.pointer_path),
                 "directories": {
                     "strategies": str(workspace.strategy_dir),
+                    "config": str(workspace.config_dir),
                     "parquet": str(workspace.parquet_dir),
                     "artifacts": str(workspace.latest_artifacts_dir),
                     "database": str(workspace.db_path),

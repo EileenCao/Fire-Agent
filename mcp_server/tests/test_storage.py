@@ -1,5 +1,7 @@
 from datetime import time
 
+import pytest
+
 from mcp_server.storage import SQLiteStore
 
 
@@ -67,3 +69,13 @@ def test_delivery_attempt_records_chunk_and_format_metadata(tmp_path):
     assert latest["chunk_index"] == 1
     assert latest["chunk_count"] == 2
     assert latest["content_format"] == "post"
+
+
+def test_schedule_rejects_invalid_timezone_and_window(tmp_path):
+    store = SQLiteStore(tmp_path / "research.sqlite3")
+    store.initialize()
+
+    with pytest.raises(ValueError, match="时区"):
+        store.configure_daily_report(timezone="Not/A_Timezone")
+    with pytest.raises(ValueError, match="发送窗口"):
+        store.configure_daily_report(send_start=time(12, 5), send_end=time(12, 3))

@@ -54,3 +54,23 @@ def test_real_market_provider_fails_when_required_skill_is_missing(tmp_path, mon
 
     with pytest.raises(AStockDataSkillError, match="a-stock-data.*安装"):
         build_market_provider()
+
+
+def test_cli_notification_status_reports_configuration_without_sending(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    workspace_path = tmp_path.parent / (tmp_path.name + "-FireAgentWorkspace")
+    assert main(["init", "--workspace", str(workspace_path)]) == 0
+    capsys.readouterr()
+    (workspace_path / "config" / ".env").write_text(
+        "FIREAGENT_ENABLE_FEISHU=1\n"
+        "FEISHU_WEBHOOK_URL=https://open.feishu.cn/open-apis/bot/v2/hook/test\n",
+        encoding="utf-8",
+    )
+    for key in ("FIREAGENT_ENABLE_FEISHU", "FEISHU_WEBHOOK_URL"):
+        monkeypatch.delenv(key, raising=False)
+
+    assert main(["notification-status"]) == 0
+
+    result = json.loads(capsys.readouterr().out)
+    assert result["webhook_configured"] is True
+    assert result["network_send_performed"] is False

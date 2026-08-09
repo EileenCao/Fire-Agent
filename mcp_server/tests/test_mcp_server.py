@@ -1,4 +1,5 @@
 from mcp_server.server import McpApplication, McpStdioServer, tool_definitions
+from mcp_server.adapters.feishu import DeliveryResult
 from mcp_server.services.historical_data import HistoricalDataResult
 from mcp_server.storage import SQLiteStore
 
@@ -144,3 +145,38 @@ def test_mcp_stdio_initialize_and_tools_list_are_json_rpc_results(tmp_path):
 
     assert initialized["result"]["capabilities"]["tools"] == {}
     assert any(tool["name"] == "watchlist_add" for tool in listed["result"]["tools"])
+
+
+def test_mcp_notification_status_does_not_send_and_exposes_schedule(tmp_path):
+    store = SQLiteStore(tmp_path / "research.sqlite3")
+    store.initialize()
+    app = McpApplication(store=store, notifier=None)
+
+    result = app.call_tool("get_notification_status")
+
+    assert result["isError"] is False
+    assert result["structuredContent"]["webhook_configured"] is False
+    assert result["structuredContent"]["network_send_performed"] is False
+    assert result["structuredContent"]["schedule"]["wake_time"] == "12:00"
+
+
+def test_mcp_test_notification_uses_configured_notifier(tmp_path):
+    store = SQLiteStore(tmp_path / "research.sqlite3")
+    store.initialize()
+
+    class FakeNotifier:
+        def __init__(self):
+            self.messages = []
+
+        def send_markdown(self, message):
+            self.messages.append(message)
+            return DeliveryResult(True, 1, 200, None)
+
+    notifier = FakeNotifier()
+    app = McpApplication(store=store, notifier=notifier)
+
+    result = app.call_tool("send_test_notification", {"message": "测试消息"})
+
+    assert result["isError"] is False
+    assert result["structuredContent"]["delivery"]["success"] is True
+    assert notifier.messages == ["测试消息"]

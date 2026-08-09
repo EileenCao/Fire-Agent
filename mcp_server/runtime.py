@@ -10,13 +10,16 @@ from mcp_server.calendar import TradingCalendar
 from mcp_server.dependencies import require_a_stock_data_skill
 from mcp_server.services.historical_data import WorkspaceHistoricalDataProvider
 from mcp_server.storage import SQLiteStore
-from mcp_server.workspace import load_workspace
+from mcp_server.workspace import WorkspaceError, load_workspace
 
 
 def load_local_env(project_root: Optional[Path] = None) -> Dict[str, str]:
     root = project_root or Path.cwd()
     values: Dict[str, str] = {}
-    workspace = load_workspace(root, required=False)
+    try:
+        workspace = load_workspace(root, required=False)
+    except WorkspaceError:
+        workspace = None
     paths = []
     if workspace is not None:
         paths.append(workspace.env_path)

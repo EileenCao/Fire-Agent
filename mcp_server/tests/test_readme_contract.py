@@ -46,3 +46,16 @@ def test_readme_explains_user_workspace_and_automatic_data():
     assert "不执行 Git 同步" in content
     assert "自动通过 `a-stock-data` 准备历史日线" in content
     assert "`--data` 仍保留" in content
+
+
+def test_readme_documents_feishu_scheduled_delivery():
+    readme = Path(__file__).parents[2] / "README.md"
+    content = readme.read_text(encoding="utf-8")
+
+    assert "notification-test" in content
+    assert "notification-status" in content
+    assert "config/.env" in content
+    assert "任务计划" in content
+    assert "daily-report --send" in content
+    assert "20 KB" in content
+    assert "双向对话" in content
