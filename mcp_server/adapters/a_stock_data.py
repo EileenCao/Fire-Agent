@@ -5,6 +5,7 @@ keeps the MCP boundary independent from the skill's embedded helper code.
 """
 
 from datetime import datetime
+import re
 from typing import Any, Dict, Iterable, Mapping, Optional
 from zoneinfo import ZoneInfo
 
@@ -54,7 +55,7 @@ def parse_tencent_quote_response(
 class TencentMarketDataProvider:
     """Fetch real-time/paused-session quotes for the watchlist."""
 
-    def __init__(self, session=None, timeout: int = 10):
+    def __init__(self, session=None, timeout: int = 10, skill=None):
         if session is None:
             try:
                 import requests
@@ -65,6 +66,7 @@ class TencentMarketDataProvider:
                 raise RuntimeError("请先安装 requests，或注入兼容的 HTTP session") from exc
         self.session = session
         self.timeout = timeout
+        self.skill = skill
 
     def snapshots_for(
         self, items: Iterable[WatchlistItem], cutoff: str
@@ -75,13 +77,15 @@ class TencentMarketDataProvider:
         try:
             quotes = self._quotes_for(watchlist)
         except Exception as exc:
-            return [_missing_snapshot(item, str(exc)) for item in watchlist]
+            return [_missing_snapshot(item, str(exc), self.skill) for item in watchlist]
 
         snapshots = []
         for item in watchlist:
             quote = quotes.get(item.code)
             if quote is None:
-                snapshots.append(_missing_snapshot(item, "行情接口没有返回该代码"))
+                snapshots.append(
+                    _missing_snapshot(item, "行情接口没有返回该代码", self.skill)
+                )
                 continue
             warnings = []
             if quote.get("is_stale"):
@@ -89,6 +93,18 @@ class TencentMarketDataProvider:
             as_of = _parse_quote_time(quote.get("quote_time"))
             if as_of is None:
                 warnings.append("行情接口未返回明确报价时间")
+            cutoff_time = _parse_cutoff_time(cutoff)
+            if as_of is not None and cutoff_time is not None and as_of.time() > cutoff_time:
+                snapshots.append(
+                    _missing_snapshot(
+                        item,
+                        "报价时间 {} 晚于报告截止 {}，已拒绝混入午间报告".format(
+                            as_of.isoformat(), cutoff
+                        ),
+                        self.skill,
+                    )
+                )
+                continue
             signals = _signals(quote.get("change_pct"))
             snapshots.append(
                 MarketSnapshot(
@@ -108,6 +124,8 @@ class TencentMarketDataProvider:
                     status="partial" if warnings else "ok",
                     signals=signals,
                     warnings=warnings,
+                    skill_name=getattr(self.skill, "name", "a-stock-data"),
+                    skill_version=getattr(self.skill, "version", None),
                 )
             )
         return snapshots
@@ -161,6 +179,15 @@ def _parse_quote_time(value: Optional[str]):
     return None
 
 
+def _parse_cutoff_time(value: str):
+    match = re.search(r"(\d{1,2}):(\d{2})", str(value or ""))
+    if not match:
+        return None
+    from datetime import time
+
+    return time(int(match.group(1)), int(match.group(2)))
+
+
 def _signals(change_pct: Optional[float]):
     if change_pct is None:
         return []
@@ -171,7 +198,7 @@ def _signals(change_pct: Optional[float]):
     return []
 
 
-def _missing_snapshot(item: WatchlistItem, error: str) -> MarketSnapshot:
+def _missing_snapshot(item: WatchlistItem, error: str, skill=None) -> MarketSnapshot:
     return MarketSnapshot(
         code=item.code,
         name=item.name or "未命名标的",
@@ -189,4 +216,6 @@ def _missing_snapshot(item: WatchlistItem, error: str) -> MarketSnapshot:
         status="partial",
         warnings=["行情数据缺失"],
         errors=[error],
+        skill_name=getattr(skill, "name", "a-stock-data"),
+        skill_version=getattr(skill, "version", None),
     )

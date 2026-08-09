@@ -7,6 +7,7 @@ from typing import Dict, Optional
 from mcp_server.adapters.a_stock_data import TencentMarketDataProvider
 from mcp_server.adapters.feishu import FeishuWebhookClient
 from mcp_server.calendar import TradingCalendar
+from mcp_server.dependencies import require_a_stock_data_skill
 from mcp_server.storage import SQLiteStore
 
 
@@ -34,12 +35,16 @@ def build_store(project_root: Optional[Path] = None) -> SQLiteStore:
     path = Path(configured) if configured else root / "data" / "stock_research.sqlite3"
     store = SQLiteStore(path)
     store.initialize()
-    store.register_feishu_channel()
+    if os.getenv("FIREAGENT_ENABLE_FEISHU") == "1":
+        store.register_feishu_channel()
     return store
 
 
-def build_market_provider():
-    return TencentMarketDataProvider()
+def build_market_provider(project_root: Optional[Path] = None):
+    root = project_root or Path.cwd()
+    load_local_env(root)
+    skill = require_a_stock_data_skill()
+    return TencentMarketDataProvider(skill=skill)
 
 
 def build_calendar(project_root: Optional[Path] = None) -> TradingCalendar:
@@ -50,6 +55,8 @@ def build_calendar(project_root: Optional[Path] = None) -> TradingCalendar:
 
 
 def build_notifier():
+    if os.getenv("FIREAGENT_ENABLE_FEISHU") != "1":
+        return None
     url = os.getenv("FEISHU_WEBHOOK_URL")
     if not url:
         return None

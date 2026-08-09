@@ -31,7 +31,12 @@ class UrllibTransport:
             response = urllib_request.urlopen(request, timeout=timeout)
             return _UrllibResponse(response.getcode(), response.read())
         except Exception as exc:
-            return _UrllibResponse(599, json.dumps({"code": -1, "msg": str(exc)}).encode("utf-8"))
+            return _UrllibResponse(
+                599,
+                json.dumps(
+                    {"code": -1, "msg": "notification network request failed"}
+                ).encode("utf-8"),
+            )
 
 
 class _UrllibResponse:
@@ -109,7 +114,10 @@ class FeishuWebhookClient:
                 )
             return response_code, None
         except Exception as exc:
-            return response_code if "response_code" in locals() else None, str(exc)
+            return (
+                response_code if "response_code" in locals() else None,
+                _safe_error(exc, self.webhook_url, self.secret),
+            )
 
 
 def _signature(timestamp: str, secret: str) -> str:
@@ -118,6 +126,14 @@ def _signature(timestamp: str, secret: str) -> str:
         string_to_sign.encode("utf-8"), digestmod=hashlib.sha256
     ).digest()
     return base64.b64encode(digest).decode("ascii")
+
+
+def _safe_error(exc, webhook_url: str, secret: Optional[str]) -> str:
+    message = str(exc) or exc.__class__.__name__
+    message = message.replace(webhook_url, "<webhook-redacted>")
+    if secret:
+        message = message.replace(secret, "<secret-redacted>")
+    return message
 
 
 def _split_text(content: str, max_bytes: int) -> List[str]:

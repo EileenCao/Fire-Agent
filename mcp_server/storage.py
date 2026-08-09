@@ -9,6 +9,7 @@ from typing import Any, Dict, Iterable, List, Optional, Union
 
 from mcp_server.domain.identifiers import normalize_ticker
 from mcp_server.domain.models import DailyReportSchedule, WatchlistItem
+from mcp_server.domain.strategy import StrategySpec
 
 
 DEFAULT_DB_PATH = Path("data") / "stock_research.sqlite3"
@@ -84,8 +85,243 @@ class SQLiteStore:
                     created_at TEXT NOT NULL,
                     FOREIGN KEY(run_id) REFERENCES report_runs(id)
                 );
+
+                CREATE TABLE IF NOT EXISTS strategy_versions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    strategy_id TEXT NOT NULL,
+                    version TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    spec_json TEXT NOT NULL,
+                    content_hash TEXT NOT NULL,
+                    is_active INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(strategy_id, version)
+                );
+
+                CREATE TABLE IF NOT EXISTS backtest_runs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    strategy_id TEXT NOT NULL,
+                    strategy_version TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    source_version TEXT,
+                    result_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS signal_evidence (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id INTEGER NOT NULL,
+                    signal_id TEXT NOT NULL UNIQUE,
+                    scenario TEXT NOT NULL,
+                    code TEXT NOT NULL,
+                    side TEXT NOT NULL,
+                    signal_date TEXT,
+                    trade_date TEXT NOT NULL,
+                    source_version TEXT,
+                    evidence_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(run_id) REFERENCES backtest_runs(id)
+                );
                 """
             )
+
+    def save_strategy_version(
+        self, spec: StrategySpec, status: str = "draft"
+    ) -> Dict[str, Any]:
+        if status not in {"draft", "approved", "active", "archived"}:
+            raise ValueError("策略状态必须是 draft、approved、active 或 archived")
+        if status in {"approved", "active"} and not spec.is_valid:
+            raise ValueError("只有有效策略才能进入 approved 或 active 状态")
+        payload = json.dumps(spec.to_dict(), ensure_ascii=False, sort_keys=True)
+        content_hash = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        timestamp = _utc_now()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO strategy_versions
+                    (strategy_id, version, name, status, spec_json, content_hash,
+                     is_active, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)
+                ON CONFLICT(strategy_id, version) DO UPDATE SET
+                    name = excluded.name,
+                    status = excluded.status,
+                    spec_json = excluded.spec_json,
+                    content_hash = excluded.content_hash,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    spec.strategy_id,
+                    spec.version,
+                    spec.name,
+                    status,
+                    payload,
+                    content_hash,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            row = connection.execute(
+                """
+                SELECT * FROM strategy_versions
+                WHERE strategy_id = ? AND version = ?
+                """,
+                (spec.strategy_id, spec.version),
+            ).fetchone()
+        return dict(row)
+
+    def activate_strategy(self, strategy_id: str, version: str) -> None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT id, status, spec_json FROM strategy_versions
+                WHERE strategy_id = ? AND version = ?
+                """,
+                (strategy_id, version),
+            ).fetchone()
+            if row is None:
+                raise ValueError("找不到策略版本：{}@{}".format(strategy_id, version))
+            if row["status"] not in {"approved", "active"}:
+                raise ValueError("只有 approved 策略版本才能激活")
+            if not StrategySpec.from_dict(json.loads(row["spec_json"])).is_valid:
+                raise ValueError("无效策略版本不能激活")
+            connection.execute(
+                "UPDATE strategy_versions SET is_active = 0, status = 'approved'"
+                " WHERE is_active = 1"
+            )
+            connection.execute(
+                """
+                UPDATE strategy_versions
+                SET is_active = 1, status = 'active', updated_at = ?
+                WHERE strategy_id = ? AND version = ?
+                """,
+                (_utc_now(), strategy_id, version),
+            )
+
+    def list_strategy_versions(self) -> List[Dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM strategy_versions ORDER BY strategy_id, version"
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_active_strategy(self) -> Optional[StrategySpec]:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT spec_json FROM strategy_versions WHERE is_active = 1 LIMIT 1"
+            ).fetchone()
+        if row is None:
+            return None
+        return StrategySpec.from_dict(json.loads(row["spec_json"]))
+
+    def save_backtest_run(
+        self, spec: StrategySpec, result: Dict[str, Any], status: str = "completed"
+    ) -> Dict[str, Any]:
+        timestamp = _utc_now()
+        result_json = json.dumps(result, ensure_ascii=False, sort_keys=True)
+        source_version = result.get("provenance", {}).get("source_version")
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO backtest_runs
+                    (strategy_id, strategy_version, status, source_version, result_json, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    spec.strategy_id,
+                    spec.version,
+                    status,
+                    source_version,
+                    result_json,
+                    timestamp,
+                ),
+            )
+            run_id = cursor.lastrowid
+            for scenario, scenario_result in result.get("scenarios", {}).items():
+                for index, trade in enumerate(scenario_result.get("trades", [])):
+                    signal_id = "{}:{}:{}".format(run_id, scenario, index)
+                    evidence = {
+                        "reason": trade.get("reason"),
+                        "price": trade.get("price"),
+                        "quantity": trade.get("quantity"),
+                        "strategy_id": spec.strategy_id,
+                        "strategy_version": spec.version,
+                    }
+                    connection.execute(
+                        """
+                        INSERT INTO signal_evidence
+                            (run_id, signal_id, scenario, code, side, signal_date,
+                             trade_date, source_version, evidence_json, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            run_id,
+                            signal_id,
+                            scenario,
+                            trade.get("code", ""),
+                            trade.get("side", ""),
+                            trade.get("signal_date"),
+                            trade.get("date", ""),
+                            source_version,
+                            json.dumps(evidence, ensure_ascii=False, sort_keys=True),
+                            timestamp,
+                        ),
+                    )
+            row = connection.execute(
+                "SELECT * FROM backtest_runs WHERE id = ?", (run_id,)
+            ).fetchone()
+        return dict(row)
+
+    def get_backtest_result(self, run_id: int) -> Optional[Dict[str, Any]]:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM backtest_runs WHERE id = ?", (run_id,)
+            ).fetchone()
+        if row is None:
+            return None
+        record = dict(row)
+        record["result"] = json.loads(record.pop("result_json"))
+        return record
+
+    def list_signal_evidence(
+        self, run_id: Optional[int] = None, signal_id: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        query = "SELECT * FROM signal_evidence"
+        params = []
+        if signal_id is not None:
+            query += " WHERE signal_id = ?"
+            params.append(signal_id)
+        elif run_id is not None:
+            query += " WHERE run_id = ?"
+            params.append(run_id)
+        query += " ORDER BY id"
+        with self._connect() as connection:
+            rows = connection.execute(query, tuple(params)).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["evidence"] = json.loads(item.pop("evidence_json"))
+            result.append(item)
+        return result
+
+    def compare_backtest_results(self, run_ids: Iterable[int]) -> List[Dict[str, Any]]:
+        values = []
+        for run_id in run_ids:
+            result = self.get_backtest_result(int(run_id))
+            if result is None:
+                raise ValueError("找不到回测运行记录：{}".format(run_id))
+            scenarios = result["result"].get("scenarios", {})
+            values.append({
+                "run_id": result["id"],
+                "strategy_id": result["strategy_id"],
+                "strategy_version": result["strategy_version"],
+                "metrics": {
+                    name: scenario.get("metrics", {})
+                    for name, scenario in scenarios.items()
+                },
+            })
+        return values
 
     def add_watchlist_item(
         self,

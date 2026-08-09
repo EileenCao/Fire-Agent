@@ -47,6 +47,8 @@ class MarketSnapshot:
     signals: List[str] = field(default_factory=list)
     warnings: List[str] = field(default_factory=list)
     errors: List[str] = field(default_factory=list)
+    skill_name: Optional[str] = None
+    skill_version: Optional[str] = None
 
 
 @dataclass(frozen=True)

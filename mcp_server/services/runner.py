@@ -51,7 +51,11 @@ class DailyReportRunner:
             for item in items:
                 from mcp_server.adapters.a_stock_data import _missing_snapshot
 
-                snapshots.append(_missing_snapshot(item, str(exc)))
+                snapshots.append(
+                    _missing_snapshot(
+                        item, str(exc), getattr(self.market_provider, "skill", None)
+                    )
+                )
 
         report = self.report_builder.build(target_date, cutoff, snapshots)
         row = self.store.create_report_run(

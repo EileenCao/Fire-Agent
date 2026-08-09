@@ -20,6 +20,8 @@ def test_report_contains_morning_cutoff_source_and_valuation():
         source_name="腾讯财经",
         source_url="https://qt.gtimg.cn/",
         status="ok",
+        skill_name="a-stock-data",
+        skill_version="3.6.0",
     )
 
     report = DailyReportBuilder().build(
@@ -33,6 +35,8 @@ def test_report_contains_morning_cutoff_source_and_valuation():
     assert "红利ETF" in report.content
     assert "PE(TTM)" in report.content
     assert "腾讯财经" in report.content
+    assert "a-stock-data" in report.content
+    assert "3.6.0" in report.content
     assert report.data_as_of == snapshot.as_of
 
 

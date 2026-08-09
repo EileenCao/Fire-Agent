@@ -72,6 +72,12 @@ def _render_item(item: MarketSnapshot) -> List[str]:
     if item.source_url:
         source = "[{}]({})".format(source, item.source_url)
     lines.append("- 数据时间：{}；来源：{}；状态：{}".format(data_time, source, item.status))
+    if item.skill_name or item.skill_version:
+        lines.append(
+            "- 数据 Skill：{}；版本：{}".format(
+                item.skill_name or "缺失", item.skill_version or "缺失"
+            )
+        )
 
     for warning in item.warnings:
         lines.append("- ⚠️ {}".format(warning))
