@@ -20,6 +20,8 @@ description: Use when an activated A-share or ETF strategy needs daily rule sign
 
 ## Output Shape
 
+观察开始时读取 `get_memory_context`。记忆只影响 AI 观察的个性化表达，不改变规则信号；输出涉及用户偏好时附带 `memory_refs`，不得自动下单。
+
 ## 与回测报告的边界
 
 日维度观察只读取已激活策略和当前 `a-stock-data` 数据，规则信号、数据时间、来源、缺失状态和 AI 观察分栏输出。它不会改写策略版本、`result.json` 或历史回测，也不会因为 AI 观察自动触发回测或下单。

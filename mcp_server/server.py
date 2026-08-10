@@ -121,6 +121,80 @@ def tool_definitions() -> list:
                 "run_id": {"type": "integer"},
             },
         }),
+        _tool("prepare_memory", "prepare user long-term memory", {
+            "type": "object",
+            "properties": {"candidate": {"type": "object"}},
+            "required": ["candidate"],
+        }),
+        _tool("save_memory", "save confirmed user long-term memory", {
+            "type": "object",
+            "properties": {
+                "candidate": {"type": "object"},
+                "approval_hash": {"type": "string"},
+                "supersedes_ids": {"type": "array", "items": {"type": "integer"}},
+                "user_confirmed": {"type": "boolean"},
+            },
+            "required": ["candidate", "approval_hash", "user_confirmed"],
+        }),
+        _tool("list_memories", "list user long-term memories", {
+            "type": "object",
+            "properties": {
+                "include_inactive": {"type": "boolean"},
+                "memory_type": {"type": "string"},
+                "scope_type": {"type": "string"},
+            },
+        }),
+        _tool("search_memories", "search user long-term memories", {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "limit": {"type": "integer"},
+            },
+            "required": ["query"],
+        }),
+        _tool("get_memory_context", "get relevant active memory context", {
+            "type": "object",
+            "properties": {
+                "scope": {"type": "object"},
+                "query": {"type": "string"},
+                "max_items": {"type": "integer"},
+                "max_bytes": {"type": "integer"},
+            },
+        }),
+        _tool("archive_memory", "archive a user long-term memory", {
+            "type": "object",
+            "properties": {
+                "memory_id": {"type": "integer"},
+                "user_confirmed": {"type": "boolean"},
+            },
+            "required": ["memory_id", "user_confirmed"],
+        }),
+        _tool("forget_memory", "permanently delete a user long-term memory", {
+            "type": "object",
+            "properties": {
+                "memory_id": {"type": "integer"},
+                "user_confirmed": {"type": "boolean"},
+            },
+            "required": ["memory_id", "user_confirmed"],
+        }),
+        _tool("export_memories", "export long-term memories as JSON", {
+            "type": "object",
+            "properties": {"output_path": {"type": "string"}},
+        }),
+        _tool("preview_memory_import", "preview long-term memory import", {
+            "type": "object",
+            "properties": {"input_path": {"type": "string"}},
+            "required": ["input_path"],
+        }),
+        _tool("import_memories", "import long-term memories after confirmation", {
+            "type": "object",
+            "properties": {
+                "input_path": {"type": "string"},
+                "import_hash": {"type": "string"},
+                "user_confirmed": {"type": "boolean"},
+            },
+            "required": ["input_path", "import_hash", "user_confirmed"],
+        }),
         _tool("watchlist_add", "添加或恢复一个股票/ETF观察标的", {
             "type": "object",
             "properties": {
@@ -240,6 +314,76 @@ class McpApplication:
 
     def _watchlist_list(self, args):
         return {"items": [asdict(item) for item in self.store.list_watchlist()]}
+
+    def _prepare_memory(self, args):
+        from mcp_server.services.memory import memory_candidate_hash, normalize_memory_candidate
+
+        candidate = normalize_memory_candidate(args.get("candidate") or {})
+        conflicts = self.store.find_memory_conflicts(candidate)
+        return {
+            "candidate": candidate,
+            "approval_hash": memory_candidate_hash(candidate),
+            "conflicts": conflicts,
+        }
+
+    def _save_memory(self, args):
+        memory = self.store.save_memory(
+            candidate=args.get("candidate") or {},
+            approval_hash=args.get("approval_hash", ""),
+            user_confirmed=bool(args.get("user_confirmed")),
+            supersedes_ids=args.get("supersedes_ids"),
+        )
+        return {"memory": memory}
+
+    def _list_memories(self, args):
+        return {
+            "memories": self.store.list_memories(
+                include_inactive=bool(args.get("include_inactive")),
+                memory_type=args.get("memory_type"),
+                scope_type=args.get("scope_type"),
+            )
+        }
+
+    def _search_memories(self, args):
+        return {
+            "memories": self.store.search_memories(
+                args.get("query", ""), limit=args.get("limit", 20)
+            )
+        }
+
+    def _get_memory_context(self, args):
+        return self.store.get_memory_context(
+            scope=args.get("scope"),
+            query=args.get("query"),
+            max_items=args.get("max_items", 20),
+            max_bytes=args.get("max_bytes", 32768),
+        )
+
+    def _archive_memory(self, args):
+        return self.store.archive_memory(
+            int(args["memory_id"]), bool(args.get("user_confirmed"))
+        )
+
+    def _forget_memory(self, args):
+        return self.store.forget_memory(
+            int(args["memory_id"]), bool(args.get("user_confirmed"))
+        )
+
+    def _export_memories(self, args):
+        output_path = args.get("output_path")
+        if not output_path:
+            output_path = Path(self.store.path).parent / "exports" / "memories.json"
+        return self.store.export_memories(output_path)
+
+    def _preview_memory_import(self, args):
+        return self.store.preview_memory_import(args["input_path"])
+
+    def _import_memories(self, args):
+        return self.store.import_memories(
+            input_path=args["input_path"],
+            import_hash=args["import_hash"],
+            user_confirmed=bool(args.get("user_confirmed")),
+        )
 
     def _validate_strategy(self, args):
         spec = StrategySpec.from_dict(args.get("strategy") or {})
@@ -459,13 +603,18 @@ class McpApplication:
         return record
 
     def _get_backtest_report_context(self, args):
-        from mcp_server.services.analysis import build_report_context
+        from mcp_server.services.analysis import build_report_context, _memory_scope
 
         run_id = int(args["run_id"])
         record = self.store.get_backtest_result(run_id)
         if record is None:
             raise ValueError("找不到回测运行记录：{}".format(run_id))
-        return build_report_context(record, self.store.list_signal_evidence(run_id))
+        evidence = self.store.list_signal_evidence(run_id)
+        return build_report_context(
+            record,
+            evidence,
+            memory_context=self.store.get_memory_context(_memory_scope(record, evidence)),
+        )
 
     def _save_backtest_analysis(self, args):
         from mcp_server.services.analysis import save_analysis_and_render

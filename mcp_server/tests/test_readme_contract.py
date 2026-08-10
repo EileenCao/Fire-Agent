@@ -10,6 +10,10 @@ def test_readme_is_windows_first_and_declares_runtime_contract():
     assert "doctor" in content
     assert "validate-strategy" in content
     assert "run-backtest" in content
+    assert "user-memory" in content
+    assert "prepare_memory" in content
+    assert "save_memory" in content
+    assert "memory-export" in content
     assert "不自动下单" in content
     assert "不需要 Ollama" in content
     assert "飞书" in content

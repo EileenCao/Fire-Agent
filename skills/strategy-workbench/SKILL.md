@@ -32,6 +32,8 @@ description: Use when a user wants to clarify, formalize, version, or backtest a
 
 ## Required Output
 
+策略澄清开始时读取 `get_memory_context`。记忆只作为用户上下文；涉及风险偏好、成本、仓位或回测口径时仍要当次向用户确认。需要保存新偏好时先调用 `prepare_memory`，确认完整候选后才调用 `save_memory`，相关上下文使用 `memory_refs`。
+
 ## 回测前确认与策略修订审批
 
 每次调用 `run_backtest` 前，必须向用户确认 `benchmark`（具体基准或明确的 `null`）以及 `risk_free_rate_annual`，然后将确认结果作为 `confirm_benchmark` 和 `confirm_risk_free_rate` 传给 MCP。正式模式还要确认成本模板和仓位方案。

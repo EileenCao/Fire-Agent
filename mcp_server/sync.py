@@ -15,6 +15,7 @@ PROJECT_SKILLS = (
     "strategy-workbench",
     "backtest-analysis",
     "daily-strategy-observer",
+    "user-memory",
 )
 
 

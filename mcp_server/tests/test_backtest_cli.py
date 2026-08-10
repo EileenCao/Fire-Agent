@@ -233,3 +233,25 @@ def test_cli_renders_an_existing_run_without_touching_unrelated_root_files(
 
     assert legacy_report.read_text(encoding="utf-8") == "legacy report"
     assert Path(rendered["artifacts"]["report"]).exists()
+
+
+def test_cli_exposes_memory_list_export_and_import_preview(
+    tmp_path, monkeypatch, capsys
+):
+    monkeypatch.chdir(tmp_path)
+    workspace_path = _init_workspace(tmp_path, capsys)
+
+    assert main(["memory-list"]) == 0
+    listed = json.loads(capsys.readouterr().out)
+    assert listed == []
+
+    export_path = tmp_path / "memories.json"
+    assert main(["memory-export", "--output", str(export_path)]) == 0
+    exported = json.loads(capsys.readouterr().out)
+    assert exported["count"] == 0
+    assert export_path.exists()
+
+    assert main(["memory-import", "--file", str(export_path)]) == 0
+    preview = json.loads(capsys.readouterr().out)
+    assert preview["mode"] == "preview"
+    assert preview["additions"] == []

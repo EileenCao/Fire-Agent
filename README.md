@@ -324,6 +324,16 @@ preview_daily_watchlist_report
 configure_daily_report
 send_test_notification
 get_notification_status
+prepare_memory
+save_memory
+list_memories
+search_memories
+get_memory_context
+archive_memory
+forget_memory
+export_memories
+preview_memory_import
+import_memories
 ```
 
 如果没有工具列表或提示 MCP 未连接，先在项目根目录运行 `python -m mcp_server.cli sync`，然后重启 MCP 或新开 Codex 任务再验证。
@@ -343,14 +353,15 @@ python -m pytest -q
 
 推荐的对话闭环是：
 
-1. 先说明标的范围、频率、入场、出场、仓位、成本、止盈止损和验证区间；
-2. Agent 使用 `strategy-workbench` 把自然语言整理为可审阅的策略版本；
-3. 用户确认后保存并激活版本，再准备数据和运行回测；
-4. `backtest-analysis` 分析收益、回撤、交易、样本内外差异、缺口和证据，并提出可选实验；
-5. Agent 读取 `get_backtest_report_context`，每条 AI 判断和实验都引用返回的 `evidence_ids`，再通过 `save_backtest_analysis` 写回 `analysis.json`；
-6. 如果要调整策略，先用 `prepare_strategy_revision` 展示完整逐字段 diff，逐项与用户讨论，用户明确批准完整 diff 后才保存新版本；
-7. 用户确认实验和新的 benchmark、无风险利率、成本、仓位后才运行新回测；
-8. `daily-strategy-observer` 在日维度输出规则信号和证据，AI 观察单独成栏，不修改规则结果。
+1. 如果用户表达“记住我的偏好/习惯”，Agent 先使用 `user-memory` 提议候选记忆，展示范围、来源、冲突和审批哈希，用户确认后才保存；
+2. 先说明标的范围、频率、入场、出场、仓位、成本、止盈止损和验证区间；
+3. Agent 使用 `strategy-workbench` 把自然语言整理为可审阅的策略版本；
+4. 用户确认后保存并激活版本，再准备数据和运行回测；
+5. `backtest-analysis` 分析收益、回撤、交易、样本内外差异、缺口和证据，并提出可选实验；
+6. Agent 读取 `get_backtest_report_context`，每条 AI 判断和实验都引用返回的 `evidence_ids`，用户偏好单独使用 `memory_refs`；
+7. 如果要调整策略，先用 `prepare_strategy_revision` 展示完整逐字段 diff，逐项与用户讨论，用户明确批准完整 diff 后才保存新版本；
+8. 用户确认实验和新的 benchmark、无风险利率、成本、仓位后才运行新回测；
+9. `daily-strategy-observer` 在日维度输出规则信号和证据，AI 观察单独成栏，不修改规则结果。
 
 系统只提供研究建议和证据，不自动下单，也不把“回测结果好”自动标成策略通过。
 
@@ -384,7 +395,8 @@ FireAgent/
 ├─ skills/
 │  ├─ strategy-workbench/SKILL.md
 │  ├─ backtest-analysis/SKILL.md
-│  └─ daily-strategy-observer/SKILL.md
+│  ├─ daily-strategy-observer/SKILL.md
+│  └─ user-memory/SKILL.md
 ├─ scripts/
 │  ├─ sync.ps1.example               # PowerShell 示例；实际脚本本地忽略
 │  └─ sync.sh.example                # Git Bash/WSL 示例；实际脚本本地忽略
@@ -427,7 +439,7 @@ FireAgent/
 
 ### SQLite 记录
 
-本地数据库默认在用户确认的独立工作区 `stock_research.sqlite3`，包括观察清单、通知配置、报告运行、投递尝试、策略版本、回测运行和信号证据。真实数据缓存和报告产物也在该工作区，不应提交 Git；Webhook 地址和签名密钥只从环境变量或未提交 `.env` 读取，不能写入数据库、日志或报告。
+本地数据库默认在用户确认的独立工作区 `stock_research.sqlite3`，包括观察清单、通知配置、报告运行、投递尝试、策略版本、回测运行、信号证据和版本化长期记忆。长期记忆支持 FTS5 搜索、三级范围、用户确认后替代、归档、永久删除及 JSON 导入导出。真实数据缓存、记忆导出和报告产物也在该工作区，不应提交 Git；Webhook 地址和签名密钥只从环境变量或未提交 `.env` 读取，不能写入数据库、日志或报告。
 
 ### 扩展方式
 
@@ -451,7 +463,11 @@ python -m mcp_server.cli doctor
 
 ### `sync` 报告找不到项目 Skill
 
-确认 `skills/strategy-workbench/SKILL.md`、`skills/backtest-analysis/SKILL.md` 和 `skills/daily-strategy-observer/SKILL.md` 都存在，并且 frontmatter 的 `name` 与目录名一致。
+确认 `skills/strategy-workbench/SKILL.md`、`skills/backtest-analysis/SKILL.md`、`skills/daily-strategy-observer/SKILL.md` 和 `skills/user-memory/SKILL.md` 都存在，并且 frontmatter 的 `name` 与目录名一致。
+
+### 长期记忆无法保存或搜索
+
+先调用 `prepare_memory`，确认候选内容没有在确认前被改写，并将返回的 `approval_hash` 原样传给 `save_memory`。如果出现冲突，必须把返回的旧 `memory_id` 放入 `supersedes_ids`。中文全文搜索无结果时仍可使用 `memory-list`；`doctor` 会报告 FTS5 是否可用。
 
 ### `.sh` 无法运行
 
@@ -476,6 +492,23 @@ PowerShell 不能直接执行 `.sh`。请使用 Git Bash 或 WSL，或者改用�
 ### 修改策略没有保存
 
 这是审批保护：先调用 `prepare_strategy_revision`，与用户逐项确认完整 diff，再将同一份 `change_set`、`approved_diff_hash`、`parent_version` 和 `user_confirmed=true` 传给 `save_strategy_version`。旧版本不会被覆盖。
+
+### 长期记忆
+
+用户可以直接对 Agent 说“记住我的最大组合回撤是 15%”或“记录我不追涨的交易原则”。Agent 应先调用 `prepare_memory` 展示规范化内容、范围、来源、冲突和审批哈希；用户确认完整内容后，才调用 `save_memory`。
+
+长期记忆支持全局、策略和股票/ETF 三级范围。它只用于个性化风险提示和策略讨论，不会自动修改策略、回测结果、规则信号或下单。风险偏好确认 180 天后会提示复核，交易心得和习惯默认长期有效。
+
+查看和迁移记忆：
+
+```powershell
+python -m mcp_server.cli memory-list
+python -m mcp_server.cli memory-search "回撤"
+python -m mcp_server.cli memory-export --output .\memory-export.json
+python -m mcp_server.cli memory-import --file .\memory-export.json
+```
+
+`memory-import` 默认只预览。确认预览返回的 `import_hash` 后，再运行 `memory-import --file <文件> --confirm-hash <哈希>`。导出文件包含个人偏好和来源摘要，应保存在独立工作区，不要提交 Git。
 
 ### 如何启用通知
 

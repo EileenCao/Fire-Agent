@@ -72,6 +72,42 @@ def main(argv=None) -> int:
     if args.command == "watchlist-list":
         _print_json([asdict(item) for item in store.list_watchlist()])
         return 0
+    if args.command == "memory-list":
+        _print_json(
+            store.list_memories(
+                include_inactive=args.include_inactive,
+                memory_type=args.memory_type,
+                scope_type=args.scope_type,
+            )
+        )
+        return 0
+    if args.command == "memory-search":
+        _print_json(store.search_memories(args.query, args.limit))
+        return 0
+    if args.command == "memory-export":
+        output_path = (
+            Path(args.output)
+            if args.output
+            else workspace.root / "exports" / "memories.json"
+        )
+        _print_json(store.export_memories(output_path))
+        return 0
+    if args.command == "memory-import":
+        try:
+            preview = store.preview_memory_import(args.file)
+            if not args.confirm_hash:
+                _print_json({"mode": "preview", **preview})
+                return 0
+            if args.confirm_hash != preview["import_hash"]:
+                raise ValueError("导入哈希与预览结果不一致")
+            imported = store.import_memories(
+                args.file, args.confirm_hash, user_confirmed=True
+            )
+            _print_json({"mode": "import", **imported})
+            return 0
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+            _print_json({"status": "failed", "error": str(exc)})
+            return 2
     if args.command == "configure":
         schedule = store.configure_daily_report(
             enabled=not args.disabled,
@@ -194,6 +230,19 @@ def _parser():
     remove.add_argument("--market", choices=["SH", "SZ", "BJ"])
     subparsers.add_parser("watchlist-list", help="列出观察清单")
 
+    memory_list = subparsers.add_parser("memory-list", help="列出长期记忆")
+    memory_list.add_argument("--include-inactive", action="store_true")
+    memory_list.add_argument("--memory-type")
+    memory_list.add_argument("--scope-type")
+    memory_search = subparsers.add_parser("memory-search", help="搜索长期记忆")
+    memory_search.add_argument("query")
+    memory_search.add_argument("--limit", type=int, default=20)
+    memory_export = subparsers.add_parser("memory-export", help="导出长期记忆")
+    memory_export.add_argument("--output")
+    memory_import = subparsers.add_parser("memory-import", help="预览或导入长期记忆")
+    memory_import.add_argument("--file", required=True)
+    memory_import.add_argument("--confirm-hash")
+
     configure = subparsers.add_parser("configure", help="配置日报时间窗口")
     configure.add_argument("--wake-time", default="12:00")
     configure.add_argument("--send-start", default="12:03")
@@ -275,6 +324,7 @@ def _doctor(root: Path) -> int:
         "workspace": workspace_result,
         "calendar_source": calendar.source,
         "a_stock_data_skill": skill_result,
+        "memory": store.memory_status(),
         "watchlist_count": len(store.list_watchlist()),
         "feishu_configured": bool(
             os.getenv("FIREAGENT_ENABLE_FEISHU") == "1"

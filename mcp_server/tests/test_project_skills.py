@@ -6,6 +6,7 @@ SKILLS = {
     "strategy-workbench": "将自然语言策略",
     "backtest-analysis": "分析已保存的回测",
     "daily-strategy-observer": "生成日维度",
+    "user-memory": "用户长期记忆",
 }
 
 
@@ -20,3 +21,6 @@ def test_project_skills_have_discoverable_contracts():
         assert "a-stock-data" in text
         assert "用户确认" in text
         assert "不自动下单" in text
+        if name != "user-memory":
+            assert "get_memory_context" in text
+            assert "memory_refs" in text

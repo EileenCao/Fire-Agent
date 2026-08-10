@@ -45,6 +45,8 @@ def test_doctor_reports_a_stock_data_skill(tmp_path, monkeypatch, capsys):
     assert result["a_stock_data_skill"]["name"] == "a-stock-data"
     assert result["a_stock_data_skill"]["version"] == "3.6.0"
     assert result["a_stock_data_skill"]["path"] == str(skill_path)
+    assert result["memory"]["status"] == "ok"
+    assert result["memory"]["fts5"] is True
 
 
 def test_real_market_provider_fails_when_required_skill_is_missing(tmp_path, monkeypatch):

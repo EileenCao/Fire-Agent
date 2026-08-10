@@ -28,6 +28,8 @@ description: Use when a saved backtest needs metric interpretation, risk review,
 
 ## Required Output
 
+分析开始时读取与策略和标的匹配的 `get_memory_context`。用户偏好只能使用 `memory_refs`，回测事实仍必须使用 `evidence_refs`；不得把记忆写入 `result.json` 或用记忆替代指标证据。
+
 ## Deterministic context and write-back contract
 
 回测完成后，先调用 `get_backtest_report_context`。只使用该上下文中的指标、验证摘要、警告分类、代表交易和 `evidence_ids`；不要把完整历史数据或未经工具返回的数字写入分析。
