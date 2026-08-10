@@ -1,6 +1,6 @@
 """Pure sizing calculations for layered core/tactical RSI strategies."""
 
-from typing import Any, Dict, Iterable, List, Set
+from typing import Any, Dict, Iterable, List, Optional, Set
 
 
 def build_ladder_state(spec, bars: Iterable[Dict[str, Any]], index: int) -> Dict[str, Any]:
@@ -63,6 +63,79 @@ def build_ladder_state(spec, bars: Iterable[Dict[str, Any]], index: int) -> Dict
     }
 
 
+def build_fibonacci_state(
+    spec, bars: Iterable[Dict[str, Any]], index: int
+) -> Dict[str, Any]:
+    """Build prior-window Fibonacci levels and first close-crossings."""
+
+    bars = list(bars)
+    fibonacci = _fibonacci_config(spec)
+    current_close = float(bars[index]["close"])
+    anchor_window = int(fibonacci.get("anchor_window", 120))
+    history = bars[max(0, index - anchor_window) : index]
+    base = {
+        "data_as_of": str(bars[index]["date"]),
+        "current_close": current_close,
+        "previous_close": (
+            float(bars[index - 1]["close"]) if index > 0 else None
+        ),
+        "anchor_window": anchor_window,
+        "history_count": len(history),
+        "anchor_high": None,
+        "anchor_low": None,
+        "level_prices": [],
+        "crossed_levels": [],
+        "final_level": 0,
+        "ladder_amount": 0.0,
+    }
+    if len(history) < anchor_window:
+        return base
+
+    anchor_high = max(float(bar["high"]) for bar in history)
+    anchor_low = min(float(bar["low"]) for bar in history)
+    ratios = [float(value) for value in fibonacci.get("ratios", [])]
+    level_prices = [
+        anchor_high - ratio * (anchor_high - anchor_low) for ratio in ratios
+    ]
+    previous_close = base["previous_close"]
+    crossed_levels = []
+    if previous_close is not None:
+        crossed_levels = [
+            level
+            for level, price in enumerate(level_prices, start=1)
+            if previous_close > price and current_close <= price
+        ]
+    final_level = max(crossed_levels, default=0)
+    amounts = [float(value) for value in fibonacci.get("amounts", [])]
+    ladder_amount = amounts[final_level - 1] if final_level and crossed_levels else 0.0
+    base.update(
+        {
+            "anchor_high": anchor_high,
+            "anchor_low": anchor_low,
+            "level_prices": level_prices,
+            "crossed_levels": crossed_levels,
+            "final_level": final_level,
+            "ladder_amount": ladder_amount,
+        }
+    )
+    return base
+
+
+def resolve_fibonacci_level(spec, state: Dict[str, Any]) -> Dict[str, Any]:
+    """Return the deepest newly crossed Fibonacci level for one signal bar."""
+
+    fibonacci = _fibonacci_config(spec)
+    final_level = int(state.get("final_level", 0))
+    new_levels = [int(level) for level in state.get("crossed_levels", [])]
+    amounts = [float(value) for value in fibonacci.get("amounts", [])]
+    ladder_amount = amounts[final_level - 1] if final_level and new_levels else 0.0
+    return {
+        "level": final_level,
+        "new_levels": new_levels,
+        "ladder_amount": ladder_amount,
+    }
+
+
 def resolve_ladder_level(
     spec,
     state: Dict[str, Any],
@@ -99,9 +172,61 @@ def resolve_tactical_cash(rsi_cash: float, ladder_amount: float) -> float:
     return max(float(rsi_cash), float(ladder_amount))
 
 
+def resolve_recovery_levels(
+    state: Dict[str, Any], tracker: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
+    """Return ladder levels to trim as the base drawdown level recovers.
+
+    The tracker covers one anchor cycle. A new anchor high clears it, and
+    annual MA boosts are deliberately excluded from the recovery trigger so a
+    disappearing boost cannot create a false recovery sell.
+    """
+
+    previous = dict(tracker or {})
+    is_new_anchor_high = bool(state.get("is_new_anchor_high"))
+    if is_new_anchor_high:
+        previous_highest = 0
+        sold_levels = set()
+    else:
+        previous_highest = max(0, int(previous.get("highest_base_level", 0)))
+        sold_levels = {int(level) for level in previous.get("sold_levels", [])}
+
+    current_level = max(0, int(state.get("base_level", 0)))
+    sell_levels = []
+    if not is_new_anchor_high:
+        sell_levels = [
+            level
+            for level in range(previous_highest, 0, -1)
+            if current_level < level and level not in sold_levels
+        ]
+        sold_levels.update(sell_levels)
+
+    highest_base_level = max(previous_highest, current_level)
+    updated_tracker = {
+        "highest_base_level": highest_base_level,
+        "sold_levels": sorted(sold_levels),
+    }
+    return {
+        "current_base_level": current_level,
+        "previous_highest_base_level": previous_highest,
+        "highest_base_level": highest_base_level,
+        "sell_levels": sell_levels,
+        "tracker": updated_tracker,
+        "is_new_anchor_high": is_new_anchor_high,
+    }
+
+
 def _ladder_config(spec) -> Dict[str, Any]:
     if hasattr(spec, "position_sizing"):
         sizing = spec.position_sizing or {}
     else:
         sizing = spec.get("position_sizing") or {}
     return dict(sizing.get("drawdown_ladder") or {})
+
+
+def _fibonacci_config(spec) -> Dict[str, Any]:
+    if hasattr(spec, "position_sizing"):
+        sizing = spec.position_sizing or {}
+    else:
+        sizing = spec.get("position_sizing") or {}
+    return dict(sizing.get("fibonacci_ladder") or {})

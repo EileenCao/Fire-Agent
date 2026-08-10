@@ -95,6 +95,97 @@ def test_performance_metrics_include_annualized_return_and_risk_ratios():
     assert metrics["calmar_ratio"] is not None
 
 
+def test_performance_metrics_exclude_idle_cash_from_invested_return():
+    metrics = calculate_performance_metrics(
+        initial=1000.0,
+        equity_curve={
+            "2024-01-01": 1000.0,
+            "2024-01-02": 1000.0,
+            "2024-01-03": 1100.0,
+            "2024-01-04": 1200.0,
+        },
+        trades=[
+            {
+                "date": "2024-01-02",
+                "side": "BUY",
+                "status": "FILLED",
+                "price": 5.0,
+                "quantity": 100,
+                "fee": 0.0,
+            },
+            {
+                "date": "2024-01-04",
+                "side": "SELL",
+                "status": "FILLED",
+                "price": 7.0,
+                "quantity": 50,
+                "fee": 0.0,
+            },
+        ],
+        cash_flows=[],
+        market_value_curve={
+            "2024-01-01": 0.0,
+            "2024-01-02": 500.0,
+            "2024-01-03": 600.0,
+            "2024-01-04": 350.0,
+        },
+    )
+
+    assert metrics["cumulative_return"] == pytest.approx(0.2)
+    assert metrics["cash_neutral_cumulative_return"] == pytest.approx(0.4)
+    assert metrics["cash_neutral_active_sessions"] == 2
+    assert metrics["cash_neutral_annualized_return"] == pytest.approx(
+        1.4 ** (365.25 / 2) - 1.0
+    )
+
+
+def test_cash_neutral_twr_and_active_drawdown_exclude_idle_cash():
+    metrics = calculate_performance_metrics(
+        initial=1000.0,
+        equity_curve={
+            "2024-01-01": 1000.0,
+            "2024-01-02": 1000.0,
+            "2024-01-03": 900.0,
+            "2024-01-04": 1100.0,
+        },
+        trades=[
+            {
+                "date": "2024-01-02",
+                "side": "BUY",
+                "status": "FILLED",
+                "price": 5.0,
+                "quantity": 100,
+                "fee": 0.0,
+            },
+            {
+                "date": "2024-01-04",
+                "side": "SELL",
+                "status": "FILLED",
+                "price": 6.0,
+                "quantity": 100,
+                "fee": 0.0,
+            },
+        ],
+        cash_flows=[],
+        market_value_curve={
+            "2024-01-01": 0.0,
+            "2024-01-02": 500.0,
+            "2024-01-03": 400.0,
+            "2024-01-04": 0.0,
+        },
+    )
+
+    assert metrics["cash_neutral_twr_cumulative_return"] == pytest.approx(0.2)
+    assert metrics["cash_neutral_twr_annualized_return"] == pytest.approx(
+        1.2 ** (365.25 / 3) - 1.0
+    )
+    assert metrics["cash_neutral_active_calendar_days"] == 3
+    assert metrics["cash_neutral_max_drawdown"] == pytest.approx(0.2)
+    assert metrics["cash_neutral_max_drawdown_peak_date"] == "2024-01-02"
+    assert metrics["cash_neutral_max_drawdown_trough_date"] == "2024-01-03"
+    assert metrics["cash_neutral_max_drawdown_recovery_date"] == "2024-01-04"
+
+
 def test_performance_metrics_expose_period_returns_and_trade_quality():
     metrics = calculate_performance_metrics(
         initial=1000.0,

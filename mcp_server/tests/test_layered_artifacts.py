@@ -10,6 +10,7 @@ def test_layered_report_shows_holdings_ladder_and_skipped_sells(tmp_path):
         "strategy_version": "1.0.0",
         "provenance": {
             "layered": {
+                "exit_mode": "recovery",
                 "core": {"ratio": 0.5, "trigger": "first_entry_signal", "hold": True},
                 "drawdown_ladder": {
                     "anchor_window": 120,
@@ -41,4 +42,5 @@ def test_layered_report_shows_holdings_ladder_and_skipped_sells(tmp_path):
 
     assert "Layered holdings" in report
     assert "Ladder assumptions" in report
+    assert "Exit mode: recovery" in report
     assert "Skipped sell signals: 2" in report

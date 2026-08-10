@@ -99,6 +99,19 @@ def _layered_payload():
     }
 
 
+def _fibonacci_payload():
+    payload = deepcopy(_layered_payload())
+    payload["position_sizing"].pop("drawdown_ladder")
+    payload["position_sizing"]["fibonacci_ladder"] = {
+        "anchor_window": 120,
+        "ratios": [0.382, 0.618, 0.786],
+        "amounts": [500, 2000, 3000],
+        "requires_rsi_entry": True,
+        "crossing": "first_close_below",
+    }
+    return payload
+
+
 def test_layered_position_sizing_round_trips_core_and_ladder_contract():
     spec = StrategySpec.from_dict(_layered_payload())
 
@@ -107,6 +120,15 @@ def test_layered_position_sizing_round_trips_core_and_ladder_contract():
     assert sizing["core"]["ratio"] == 0.5
     assert sizing["drawdown_ladder"]["thresholds"] == [0.10, 0.20, 0.30]
     assert sizing["drawdown_ladder"]["combine"] == "max"
+
+
+def test_layered_position_sizing_accepts_zero_core_ratio_for_tactical_only():
+    payload = _layered_payload()
+    payload["position_sizing"]["core"]["ratio"] = 0.0
+
+    spec = StrategySpec.from_dict(payload)
+
+    assert spec.is_valid
 
 
 def test_layered_position_sizing_rejects_invalid_core_ratio():
@@ -129,3 +151,55 @@ def test_layered_position_sizing_rejects_invalid_ladder_shape():
 
     assert not spec.is_valid
     assert any("drawdown_ladder" in error for error in spec.validation_errors)
+
+
+def test_layered_exit_mode_accepts_rsi_or_recovery_only():
+    recovery_payload = deepcopy(_layered_payload())
+    recovery_payload["position_sizing"]["exit_mode"] = "recovery"
+    assert StrategySpec.from_dict(recovery_payload).is_valid
+
+    invalid_payload = deepcopy(_layered_payload())
+    invalid_payload["position_sizing"]["exit_mode"] = "unknown"
+    spec = StrategySpec.from_dict(invalid_payload)
+
+    assert not spec.is_valid
+    assert any("exit_mode" in error for error in spec.validation_errors)
+
+
+def test_layered_sell_basis_accepts_all_or_profitable_tactical_only():
+    profitable_payload = deepcopy(_layered_payload())
+    profitable_payload["position_sizing"]["sell_basis"] = "profitable_tactical"
+    assert StrategySpec.from_dict(profitable_payload).is_valid
+
+    invalid_payload = deepcopy(_layered_payload())
+    invalid_payload["position_sizing"]["sell_basis"] = "latest_batch"
+    spec = StrategySpec.from_dict(invalid_payload)
+
+    assert not spec.is_valid
+    assert any("sell_basis" in error for error in spec.validation_errors)
+
+
+def test_fibonacci_ladder_contract_round_trips_without_drawdown_ladder():
+    spec = StrategySpec.from_dict(_fibonacci_payload())
+
+    assert spec.is_valid
+    sizing = spec.to_dict()["position_sizing"]
+    assert "drawdown_ladder" not in sizing
+    assert sizing["fibonacci_ladder"]["ratios"] == [0.382, 0.618, 0.786]
+
+
+def test_fibonacci_ladder_rejects_invalid_ratios_and_mixed_ladders():
+    invalid = _fibonacci_payload()
+    invalid["position_sizing"]["fibonacci_ladder"]["ratios"] = [0.618, 0.382]
+    invalid_spec = StrategySpec.from_dict(invalid)
+
+    mixed = _fibonacci_payload()
+    mixed["position_sizing"]["drawdown_ladder"] = _layered_payload()["position_sizing"][
+        "drawdown_ladder"
+    ]
+    mixed_spec = StrategySpec.from_dict(mixed)
+
+    assert not invalid_spec.is_valid
+    assert any("fibonacci_ladder" in error for error in invalid_spec.validation_errors)
+    assert not mixed_spec.is_valid
+    assert any("fibonacci_ladder" in error for error in mixed_spec.validation_errors)

@@ -141,6 +141,10 @@ def calculate_performance_metrics(
         cash_curve=cash_curve,
         market_value_curve=market_value_curve,
     )
+    cash_neutral_metrics = _cash_neutral_metrics(
+        market_value_curve=market_value_curve,
+        trades=trades,
+    )
     return {
         "initial_capital": float(initial),
         "final_equity": round(final, 8),
@@ -187,6 +191,7 @@ def calculate_performance_metrics(
         "annual_returns": _period_returns(dates, values, "%Y"),
         "monthly_returns": _period_returns(dates, values, "%Y-%m"),
         **curve_metrics,
+        **cash_neutral_metrics,
     }
 
 
@@ -223,6 +228,17 @@ def _empty_metrics(initial: float) -> Dict[str, Any]:
         "time_in_market_ratio": None,
         "current_cash": None,
         "current_market_value": None,
+        "cash_neutral_cumulative_return": None,
+        "cash_neutral_annualized_return": None,
+        "cash_neutral_active_sessions": 0,
+        "cash_neutral_twr_cumulative_return": None,
+        "cash_neutral_twr_annualized_return": None,
+        "cash_neutral_active_calendar_days": 0,
+        "cash_neutral_max_drawdown": None,
+        "cash_neutral_max_drawdown_peak_date": None,
+        "cash_neutral_max_drawdown_trough_date": None,
+        "cash_neutral_max_drawdown_recovery_date": None,
+        "cash_neutral_max_drawdown_duration_days": 0,
     }
 
 
@@ -300,6 +316,239 @@ def _curve_metrics(
         "current_cash": float((cash_curve or {}).get(dates[-1], 0.0)),
         "current_market_value": float(market_value_curve.get(dates[-1], 0.0)),
     }
+
+
+def _cash_neutral_metrics(
+    market_value_curve: Optional[Dict[str, float]],
+    trades: Iterable[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Measure invested-capital return while excluding idle cash.
+
+    Buys are treated as invested-capital outflows, sells as capital returns,
+    and the final market value as the terminal return. This is an XIRR-style
+    money-weighted return for the invested sub-account; cash left outside the
+    sub-account never enters its denominator.
+    """
+    trades = [dict(trade) for trade in trades]
+    twr_metrics = _cash_neutral_twr_metrics(market_value_curve, trades)
+    if not market_value_curve:
+        return {
+            "cash_neutral_cumulative_return": None,
+            "cash_neutral_annualized_return": None,
+            "cash_neutral_active_sessions": 0,
+            **twr_metrics,
+        }
+
+    dates = sorted(str(day) for day in market_value_curve if str(day))
+    if not dates:
+        return {
+            "cash_neutral_cumulative_return": None,
+            "cash_neutral_annualized_return": None,
+            "cash_neutral_active_sessions": 0,
+            **twr_metrics,
+        }
+
+    cash_flows = []
+    for raw_trade in trades:
+        trade = dict(raw_trade)
+        if trade.get("status") not in {"FILLED", "PARTIAL"}:
+            continue
+        day = str(trade.get("date", ""))
+        if not day or trade.get("side") not in {"BUY", "SELL"}:
+            continue
+        notional = float(trade.get("price", 0.0)) * float(
+            trade.get("filled_quantity", trade.get("quantity", 0.0)) or 0.0
+        )
+        fee = float(trade.get("fee", 0.0) or 0.0)
+        amount = -(notional + fee) if trade["side"] == "BUY" else notional - fee
+        cash_flows.append((_parse_date(day), amount))
+
+    if not cash_flows:
+        return {
+            "cash_neutral_cumulative_return": None,
+            "cash_neutral_annualized_return": None,
+            "cash_neutral_active_sessions": 0,
+            **twr_metrics,
+        }
+
+    final_day = _parse_date(dates[-1])
+    cash_flows.append((final_day, float(market_value_curve[dates[-1]] or 0.0)))
+    cash_flows.sort(key=lambda item: item[0])
+    rate = _xirr(cash_flows)
+    active_sessions = sum(
+        1
+        for previous, current in zip(dates, dates[1:])
+        if float(market_value_curve[previous] or 0.0) > 0.0
+    )
+    if rate is None:
+        return {
+            "cash_neutral_cumulative_return": None,
+            "cash_neutral_annualized_return": None,
+            "cash_neutral_active_sessions": active_sessions,
+            **twr_metrics,
+        }
+    elapsed_days = max(1, (final_day - cash_flows[0][0]).days)
+    factor = (1.0 + rate) ** (elapsed_days / 365.25)
+    return {
+        "cash_neutral_cumulative_return": round(factor - 1.0, 8),
+        "cash_neutral_annualized_return": _round_or_none(rate),
+        "cash_neutral_active_sessions": active_sessions,
+        **twr_metrics,
+    }
+
+
+def _cash_neutral_twr_metrics(
+    market_value_curve: Optional[Dict[str, float]],
+    trades: Iterable[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Calculate active-position TWR and drawdown without idle cash."""
+
+    empty = {
+        "cash_neutral_twr_cumulative_return": None,
+        "cash_neutral_twr_annualized_return": None,
+        "cash_neutral_active_calendar_days": 0,
+        "cash_neutral_max_drawdown": None,
+        "cash_neutral_max_drawdown_peak_date": None,
+        "cash_neutral_max_drawdown_trough_date": None,
+        "cash_neutral_max_drawdown_recovery_date": None,
+        "cash_neutral_max_drawdown_duration_days": 0,
+    }
+    if not market_value_curve:
+        return empty
+
+    dates = sorted(str(day) for day in market_value_curve if str(day))
+    if not dates:
+        return empty
+
+    flows_by_day: Dict[str, List[float]] = {}
+    for raw_trade in trades:
+        trade = dict(raw_trade)
+        if trade.get("status") not in {"FILLED", "PARTIAL"}:
+            continue
+        day = str(trade.get("date", ""))
+        if not day or trade.get("side") not in {"BUY", "SELL"}:
+            continue
+        notional = float(trade.get("price", 0.0)) * float(
+            trade.get("filled_quantity", trade.get("quantity", 0.0)) or 0.0
+        )
+        values = flows_by_day.setdefault(day, [0.0, 0.0])
+        if trade["side"] == "BUY":
+            values[0] += notional
+        else:
+            values[1] += notional
+
+    factor = 1.0
+    active_sessions = 0
+    episodes = []
+    episode = None
+    previous_day = None
+    previous_value = 0.0
+    for day in dates:
+        current_value = float(market_value_curve.get(day, 0.0) or 0.0)
+        buy_value, sell_value = flows_by_day.get(day, [0.0, 0.0])
+
+        if previous_day is not None and previous_value > 0.0:
+            pre_flow_value = current_value + sell_value - buy_value
+            daily_factor = pre_flow_value / previous_value
+            factor *= daily_factor
+            active_sessions += 1
+            if episode is None:
+                episode = {"dates": [previous_day], "values": [1.0]}
+            episode["dates"].append(day)
+            episode["values"].append(episode["values"][-1] * daily_factor)
+
+        if previous_value <= 0.0 and current_value > 0.0:
+            episode = {"dates": [day], "values": [1.0]}
+
+        if previous_value > 0.0 and current_value <= 0.0:
+            if episode is not None:
+                episodes.append(episode)
+                episode = None
+
+        previous_day = day
+        previous_value = current_value
+
+    if episode is not None:
+        episodes.append(episode)
+    if not episodes:
+        return empty
+
+    active_calendar_days = sum(
+        max(1, (_parse_date(item["dates"][-1]) - _parse_date(item["dates"][0])).days + 1)
+        for item in episodes
+    )
+    drawdown_stats = [
+        _drawdown_stats(item["dates"], item["values"]) for item in episodes
+    ]
+    worst = max(drawdown_stats, key=lambda item: item["max_drawdown"])
+    return {
+        "cash_neutral_twr_cumulative_return": round(factor - 1.0, 8),
+        "cash_neutral_twr_annualized_return": _round_or_none(
+            _annualize(factor, active_calendar_days)
+        ),
+        "cash_neutral_active_calendar_days": active_calendar_days,
+        "cash_neutral_max_drawdown": worst["max_drawdown"],
+        "cash_neutral_max_drawdown_peak_date": (
+            worst["max_drawdown_peak_date"]
+            if worst["max_drawdown"] > 0
+            else None
+        ),
+        "cash_neutral_max_drawdown_trough_date": (
+            worst["max_drawdown_trough_date"]
+            if worst["max_drawdown"] > 0
+            else None
+        ),
+        "cash_neutral_max_drawdown_recovery_date": (
+            worst["max_drawdown_recovery_date"]
+            if worst["max_drawdown"] > 0
+            else None
+        ),
+        "cash_neutral_max_drawdown_duration_days": (
+            worst["max_drawdown_duration_days"]
+            if worst["max_drawdown"] > 0
+            else 0
+        ),
+    }
+
+
+def _xirr(cash_flows) -> Optional[float]:
+    if len(cash_flows) < 2:
+        return None
+    if not any(amount < 0 for _, amount in cash_flows):
+        return None
+    if not any(amount > 0 for _, amount in cash_flows):
+        return None
+
+    start = cash_flows[0][0]
+
+    def npv(rate):
+        return sum(
+            amount
+            / ((1.0 + rate) ** ((day - start).days / 365.25))
+            for day, amount in cash_flows
+        )
+
+    low = -0.9999
+    high = 1.0
+    low_value = npv(low)
+    high_value = npv(high)
+    for _ in range(256):
+        if low_value * high_value <= 0.0:
+            break
+        high = high * 2.0 + 1.0
+        high_value = npv(high)
+    if low_value * high_value > 0.0:
+        return None
+    for _ in range(200):
+        middle = (low + high) / 2.0
+        middle_value = npv(middle)
+        if abs(middle_value) < 1e-8:
+            return middle
+        if low_value * middle_value <= 0.0:
+            high, high_value = middle, middle_value
+        else:
+            low, low_value = middle, middle_value
+    return (low + high) / 2.0
 
 
 def _trade_amount(trades: Iterable[Dict[str, Any]], key: str) -> float:

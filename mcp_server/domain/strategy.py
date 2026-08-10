@@ -229,6 +229,15 @@ def _validate_position_sizing(sizing):
     if not sizing:
         return []
     errors = []
+    exit_mode = sizing.get("exit_mode")
+    if exit_mode is not None and exit_mode not in {"rsi", "recovery"}:
+        errors.append("exit_mode must be 'rsi' or 'recovery'")
+    sell_basis = sizing.get("sell_basis")
+    if sell_basis is not None and sell_basis not in {
+        "all_tactical",
+        "profitable_tactical",
+    }:
+        errors.append("sell_basis must be 'all_tactical' or 'profitable_tactical'")
     scope = sizing.get("capital_scope", "per_symbol")
     if scope not in {"per_symbol", "portfolio"}:
         errors.append("capital_scope 必须是 per_symbol 或 portfolio")
@@ -272,16 +281,19 @@ def _validate_layered_sizing(sizing):
             errors.append("core 必须是对象")
         else:
             ratio = _number(core.get("ratio"))
-            if ratio is None or ratio <= 0 or ratio >= 1:
-                errors.append("core ratio 必须大于 0 且小于 1")
+            if ratio is None or ratio < 0 or ratio >= 1:
+                errors.append("core ratio 必须大于等于 0 且小于 1")
             if core.get("trigger", "first_entry_signal") != "first_entry_signal":
                 errors.append("core trigger 必须是 first_entry_signal")
             if core.get("hold", True) is not True:
                 errors.append("core hold 必须为 true")
 
     ladder = sizing.get("drawdown_ladder")
+    fibonacci = sizing.get("fibonacci_ladder")
+    if ladder is not None and fibonacci is not None:
+        errors.append("drawdown_ladder 和 fibonacci_ladder 不能同时配置")
     if ladder is None:
-        return errors
+        return errors + _validate_fibonacci_ladder(fibonacci)
     if not isinstance(ladder, dict):
         return errors + ["drawdown_ladder 必须是对象"]
 
@@ -327,6 +339,45 @@ def _validate_layered_sizing(sizing):
         value = _number(ladder.get(key, default))
         if value is None or value < 0 or value >= 1:
             errors.append("drawdown_ladder {} 必须是 0 到 1 之间数值".format(key))
+    return errors + _validate_fibonacci_ladder(fibonacci)
+
+
+def _validate_fibonacci_ladder(ladder):
+    if ladder is None:
+        return []
+    if not isinstance(ladder, dict):
+        return ["fibonacci_ladder 必须是对象"]
+
+    errors = []
+    ratios = ladder.get("ratios")
+    amounts = ladder.get("amounts")
+    if not isinstance(ratios, list) or not ratios:
+        errors.append("fibonacci_ladder ratios 必须是非空数组")
+        ratios = []
+    if not isinstance(amounts, list) or not amounts:
+        errors.append("fibonacci_ladder amounts 必须是非空数组")
+        amounts = []
+    if ratios and amounts and len(ratios) != len(amounts):
+        errors.append("fibonacci_ladder ratios 和 amounts 长度必须一致")
+
+    previous = 0.0
+    for value in ratios:
+        number = _number(value)
+        if number is None or number <= 0 or number >= 1 or number <= previous:
+            errors.append("fibonacci_ladder ratios 必须为 0 到 1 之间的递增数值")
+            break
+        previous = number
+    for value in amounts:
+        if _positive_number(value) is None:
+            errors.append("fibonacci_ladder amounts 必须为正数")
+            break
+
+    if _positive_int(ladder.get("anchor_window", 120)) is None:
+        errors.append("fibonacci_ladder anchor_window 必须是正整数")
+    if ladder.get("requires_rsi_entry", True) is not True:
+        errors.append("fibonacci_ladder requires_rsi_entry 必须为 true")
+    if ladder.get("crossing", "first_close_below") != "first_close_below":
+        errors.append("fibonacci_ladder crossing 必须是 first_close_below")
     return errors
 
 

@@ -6,7 +6,7 @@ from zoneinfo import ZoneInfo
 
 from mcp_server.calendar import TradingCalendar
 from mcp_server.domain.models import RunResult
-from mcp_server.services.reporting import DailyReportBuilder
+from mcp_server.services.reporting import DailyReportBuilder, write_daily_report
 
 
 class DailyReportRunner:
@@ -17,6 +17,8 @@ class DailyReportRunner:
         notifier=None,
         calendar: Optional[TradingCalendar] = None,
         report_builder: Optional[DailyReportBuilder] = None,
+        strategy_signal_builder: Optional[Callable] = None,
+        report_dir=None,
         now_fn: Optional[Callable[[], datetime]] = None,
         sleep_fn: Optional[Callable[[float], None]] = None,
         require_authoritative_calendar: bool = False,
@@ -26,6 +28,8 @@ class DailyReportRunner:
         self.notifier = notifier
         self.calendar = calendar or TradingCalendar()
         self.report_builder = report_builder or DailyReportBuilder()
+        self.strategy_signal_builder = strategy_signal_builder
+        self.report_dir = report_dir
         self.now_fn = now_fn or (lambda: datetime.now(timezone.utc))
         self.sleep_fn = sleep_fn or __import__("time").sleep
         self.require_authoritative_calendar = require_authoritative_calendar
@@ -108,7 +112,29 @@ class DailyReportRunner:
                     )
                 )
 
-        report = self.report_builder.build(target_date, cutoff, snapshots)
+        strategy_signals = []
+        if self.strategy_signal_builder is not None:
+            try:
+                strategy_signals = self.strategy_signal_builder(
+                    items, snapshots, target_date
+                )
+            except Exception as exc:
+                strategy_signals = [
+                    {
+                        "status": "unavailable",
+                        "action": "UNDETERMINED",
+                        "mode": "morning_close_approximation",
+                        "error": str(exc),
+                    }
+                ]
+        report = self.report_builder.build(
+            target_date,
+            cutoff,
+            snapshots,
+            strategy_signals=strategy_signals,
+        )
+        if self.report_dir is not None:
+            write_daily_report(self.report_dir, target_date, report.content)
         self.store.update_report_run(
             run_id,
             report.status,

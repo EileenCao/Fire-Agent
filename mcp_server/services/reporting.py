@@ -1,6 +1,7 @@
 """Deterministic, evidence-labelled Markdown report generation."""
 
 from datetime import date, datetime
+from pathlib import Path
 from typing import Iterable, List, Optional
 
 from mcp_server.domain.models import DailyReport, MarketSnapshot
@@ -12,8 +13,10 @@ class DailyReportBuilder:
         report_date: date,
         cutoff: str,
         snapshots: Iterable[MarketSnapshot],
+        strategy_signals: Optional[Iterable[dict]] = None,
     ) -> DailyReport:
         items = list(snapshots)
+        signals = list(strategy_signals or [])
         statuses = [item.status for item in items]
         status = "ok" if items and all(value == "ok" for value in statuses) else "partial"
         data_times = [item.as_of for item in items if item.as_of is not None]
@@ -34,6 +37,10 @@ class DailyReportBuilder:
                 lines.extend(_render_item(item))
                 if index != len(items) - 1:
                     lines.append("---")
+        if signals:
+            lines.extend(["", "## 策略信号", ""])
+            for signal in signals:
+                lines.extend(_render_strategy_signal(signal))
         lines.extend(
             [
                 "",
@@ -48,6 +55,48 @@ class DailyReportBuilder:
             status=status,
             snapshots=items,
         )
+
+
+def write_daily_report(report_dir: Path, report_date: date, content: str) -> Path:
+    """Persist one local Markdown report without replacing prior dates."""
+
+    target_dir = Path(report_dir) / "daily"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target = target_dir / "{}.md".format(report_date.isoformat())
+    temporary = target.with_suffix(".md.tmp")
+    temporary.write_text(content, encoding="utf-8")
+    temporary.replace(target)
+    return target
+
+
+def _render_strategy_signal(signal: dict) -> List[str]:
+    status = signal.get("status", "unknown")
+    strategy_id = signal.get("strategy_id", "unknown")
+    strategy_version = signal.get("strategy_version", "unknown")
+    action = signal.get("action", "UNDETERMINED")
+    mode = signal.get("mode", "unknown")
+    details = signal.get("signal") or {}
+    state = signal.get("state") or {}
+    evidence = details.get("evidence") or {}
+    lines = [
+        "- 标的：{}；动作：{}；状态：{}".format(
+            signal.get("code", "512890"), action, status
+        ),
+        "- 策略：{} @ {}；运行口径：{}".format(
+            strategy_id, strategy_version, mode
+        ),
+        "- 买入金额：{}；卖出数量：{}；模拟现金：{}；总数量：{}".format(
+            details.get("buy_cash", 0),
+            details.get("sell_quantity", 0),
+            state.get("cash", "不可用"),
+            state.get("total_quantity", "不可用"),
+        ),
+    ]
+    if evidence.get("indicator_values"):
+        lines.append("- 指标：{}".format(evidence["indicator_values"]))
+    if evidence.get("morning_price") is not None:
+        lines.append("- 上午临时收盘价：{}（仅为运营近似，不改变正式回测策略）".format(evidence["morning_price"]))
+    return lines
 
 
 def _render_item(item: MarketSnapshot) -> List[str]:

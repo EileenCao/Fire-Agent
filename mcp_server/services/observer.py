@@ -4,7 +4,12 @@ from typing import Any, Dict, Optional
 
 from mcp_server.services.backtesting import _normalize_data, _rules_match
 from mcp_server.services.indicators import build_indicator_series
-from mcp_server.services.layered_sizing import build_ladder_state, resolve_tactical_cash
+from mcp_server.services.layered_sizing import (
+    build_fibonacci_state,
+    build_ladder_state,
+    resolve_fibonacci_level,
+    resolve_tactical_cash,
+)
 from mcp_server.services.signal_planner import build_signal_plan
 
 
@@ -48,8 +53,10 @@ class StrategyObserver:
             layered = bool(
                 (spec.position_sizing or {}).get("core")
                 or (spec.position_sizing or {}).get("drawdown_ladder")
+                or (spec.position_sizing or {}).get("fibonacci_ladder")
             )
             ladder_state = None
+            fibonacci_state = None
             signal_evidence = None
             base_evidence = {
                 "signal_date": str(latest["date"]),
@@ -86,11 +93,14 @@ class StrategyObserver:
                 if layered:
                     if (spec.position_sizing or {}).get("drawdown_ladder"):
                         ladder_state = build_ladder_state(spec, bars, index)
+                    elif (spec.position_sizing or {}).get("fibonacci_ladder"):
+                        fibonacci_state = build_fibonacci_state(spec, bars, index)
                     evidence.update(
                         {
                             "core_quantity": position_details["core_quantity"],
                             "tactical_quantity": position_details["tactical_quantity"],
                             "ladder_state": ladder_state,
+                            "fibonacci_state": fibonacci_state,
                         }
                     )
                     signal_evidence = dict(evidence)
@@ -102,12 +112,25 @@ class StrategyObserver:
                         if ladder_state is not None and action == "BUY"
                         else plan["buy_cash"]
                     )
+                    if fibonacci_state is not None and action == "BUY":
+                        fibonacci_result = resolve_fibonacci_level(spec, fibonacci_state)
+                        signal_evidence["buy_cash"] = resolve_tactical_cash(
+                            plan["buy_cash"], fibonacci_result["ladder_amount"]
+                        )
                     signal_evidence["ladder"] = (
                         {
                             "state": ladder_state,
                             "ladder_amount": ladder_state["ladder_amount"],
                         }
                         if ladder_state is not None
+                        else None
+                    )
+                    signal_evidence["fibonacci"] = (
+                        {
+                            "state": fibonacci_state,
+                            **resolve_fibonacci_level(spec, fibonacci_state),
+                        }
+                        if fibonacci_state is not None
                         else None
                     )
                     if action == "SELL":
@@ -147,6 +170,7 @@ class StrategyObserver:
                         "core_quantity": position_details["core_quantity"],
                         "tactical_quantity": position_details["tactical_quantity"],
                         "ladder_state": ladder_state,
+                        "fibonacci_state": fibonacci_state,
                         "signal_evidence": signal_evidence or evidence,
                     }
                 )

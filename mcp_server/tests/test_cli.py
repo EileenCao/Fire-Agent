@@ -1,8 +1,9 @@
 import json
+import sys
 
 import pytest
 
-from mcp_server.cli import main
+from mcp_server.cli import _safe_print, main
 from mcp_server.dependencies import AStockDataSkillError
 from mcp_server.runtime import build_market_provider
 
@@ -31,6 +32,30 @@ def test_cli_can_configure_and_list_a_local_watchlist(tmp_path, monkeypatch, cap
     assert main(["watchlist-list"]) == 0
     listed = json.loads(capsys.readouterr().out)
     assert listed[0]["instrument_type"] == "ETF"
+
+
+def test_safe_print_replaces_unencodable_console_characters(monkeypatch):
+    class GbkConsole:
+        encoding = "gbk"
+
+        def __init__(self):
+            self.value = ""
+
+        def write(self, value):
+            value.encode(self.encoding)
+            self.value += value
+            return len(value)
+
+        def flush(self):
+            return None
+
+    console = GbkConsole()
+    monkeypatch.setattr(sys, "stdout", console)
+
+    _safe_print("警告 ⚠")
+
+    assert "警告" in console.value
+    assert "⚠" not in console.value
 
 
 def test_doctor_reports_a_stock_data_skill(tmp_path, monkeypatch, capsys):

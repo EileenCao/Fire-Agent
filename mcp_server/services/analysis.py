@@ -251,7 +251,9 @@ def _compact_metrics(metrics):
     keys = (
         "initial_capital", "final_equity", "net_profit", "time_weighted_return",
         "annualized_return", "cash_neutral_cumulative_return",
-        "cash_neutral_annualized_return", "annualized_volatility", "max_drawdown", "sharpe_ratio",
+        "cash_neutral_annualized_return", "cash_neutral_twr_cumulative_return",
+        "cash_neutral_twr_annualized_return", "cash_neutral_active_calendar_days",
+        "cash_neutral_max_drawdown", "annualized_volatility", "max_drawdown", "sharpe_ratio",
         "sortino_ratio", "calmar_ratio", "trade_count", "win_rate", "profit_factor",
     )
     return {key: metrics.get(key) for key in keys if key in metrics}

@@ -1,6 +1,11 @@
 from mcp_server.services.observer import StrategyObserver
 
-from mcp_server.tests.test_layered_backtesting import _bars, _layered_spec, _scenario
+from mcp_server.tests.test_layered_backtesting import (
+    _bars,
+    _fibonacci_spec,
+    _layered_spec,
+    _scenario,
+)
 
 
 def test_observer_exposes_layered_holdings_and_ladder_evidence():
@@ -40,3 +45,19 @@ def test_observer_sell_evidence_identifies_tactical_only_position():
     assert signal["tactical_quantity"] == 100
     assert signal["signal_evidence"]["book"] == "tactical"
     assert signal["signal_evidence"]["sell_quantity"] == 100
+
+
+def test_observer_exposes_fibonacci_crossing_and_cash_evidence():
+    spec = _fibonacci_spec()
+    bars = _bars([1.05] * 120 + [1.02])
+    for bar in bars:
+        bar["high"] = 1.10
+        bar["low"] = 0.90
+
+    observed = StrategyObserver().observe(spec, {"512890": bars})
+    signal = observed["signals"][0]
+
+    assert signal["action"] == "BUY"
+    assert signal["fibonacci_state"]["crossed_levels"] == [1]
+    assert signal["signal_evidence"]["fibonacci"]["ladder_amount"] == 500
+    assert signal["signal_evidence"]["buy_cash"] == 500

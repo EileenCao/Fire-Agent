@@ -20,6 +20,7 @@ from mcp_server.runtime import (
     load_local_env,
 )
 from mcp_server.services.runner import DailyReportRunner
+from mcp_server.services.morning_report import build_morning_strategy_signal_builder
 from mcp_server.services.artifacts import write_backtest_artifacts
 from mcp_server.services.backtest_pipeline import (
     benchmark_provider_code,
@@ -180,11 +181,20 @@ def main(argv=None) -> int:
         if should_send and notifier is None:
             print("未启用或未配置 Feishu；本地验证请使用 preview（默认不发送）。", file=sys.stderr)
             return 2
+        strategy_path = workspace.strategy_dir / "512890-core-rsi-profit-0.json"
+        strategy_signal_builder = None
+        if strategy_path.exists():
+            strategy_signal_builder = build_morning_strategy_signal_builder(
+                strategy_path,
+                build_historical_data_provider(root),
+            )
         runner = DailyReportRunner(
             store=store,
             market_provider=build_market_provider(root),
             notifier=notifier,
             calendar=build_calendar(root, require_workspace=True),
+            strategy_signal_builder=strategy_signal_builder,
+            report_dir=workspace.reports_dir,
             require_authoritative_calendar=should_send,
         )
         result = runner.run(
@@ -192,7 +202,7 @@ def main(argv=None) -> int:
             send=should_send,
         )
         if result.status == "previewed":
-            print(result.message)
+            _safe_print(result.message)
         else:
             _print_json({"status": result.status, "report_id": result.report_id, "message": result.message})
         return 0 if result.status not in {
@@ -371,6 +381,17 @@ def _init_workspace(root: Path, workspace_path: Path, overwrite: bool) -> int:
 
 def _print_json(value) -> None:
     print(json.dumps(value, ensure_ascii=False, indent=2, default=str))
+
+
+def _safe_print(value) -> None:
+    try:
+        print(value)
+    except UnicodeEncodeError:
+        encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+        fallback = str(value).encode(encoding, errors="replace").decode(
+            encoding, errors="replace"
+        )
+        print(fallback)
 
 
 def _validate_strategy_file(path: Path) -> int:

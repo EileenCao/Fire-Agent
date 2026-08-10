@@ -161,3 +161,33 @@ def test_runner_blocks_scheduled_send_without_authoritative_calendar(tmp_path, m
     result = runner.run(date(2026, 8, 10), send=True)
 
     assert result.status == "blocked_calendar_unavailable"
+
+
+def test_runner_includes_strategy_signal_and_writes_local_report(tmp_path):
+    store = SQLiteStore(tmp_path / "research.sqlite3")
+    store.initialize()
+    store.add_watchlist_item("512890", instrument_type="ETF")
+    runner = DailyReportRunner(
+        store=store,
+        market_provider=FakeMarketProvider(),
+        calendar=TradingCalendar(),
+        report_dir=tmp_path / "reports",
+        strategy_signal_builder=lambda items, snapshots, report_date: [
+            {
+                "status": "ok",
+                "action": "HOLD",
+                "mode": "morning_close_approximation",
+                "strategy_id": "test-strategy",
+                "strategy_version": "1.0.0",
+                "signal": {"buy_cash": 0, "sell_quantity": 0, "evidence": {}},
+                "state": {"cash": 50000, "total_quantity": 0},
+            }
+        ],
+    )
+
+    result = runner.run(date(2026, 8, 10), send=False)
+
+    assert result.status == "previewed"
+    report_path = tmp_path / "reports" / "daily" / "2026-08-10.md"
+    assert report_path.exists()
+    assert "test-strategy" in report_path.read_text(encoding="utf-8")

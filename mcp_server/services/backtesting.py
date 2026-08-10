@@ -8,7 +8,10 @@ from mcp_server.domain.identifiers import normalize_ticker
 from mcp_server.services.indicators import build_indicator_series
 from mcp_server.services.layered_sizing import (
     build_ladder_state,
+    build_fibonacci_state,
     resolve_ladder_level,
+    resolve_fibonacci_level,
+    resolve_recovery_levels,
     resolve_tactical_cash,
 )
 from mcp_server.services.performance import calculate_performance_metrics
@@ -49,6 +52,17 @@ class PositionBook:
             max(0, lot.quantity)
             for lot in self.lots
             if lot.quantity > 0 and lot.available_date <= day
+        )
+
+    def available_profitable_quantity(self, price: float, day: str) -> int:
+        """Return T+1-available lots whose buy price is below current price."""
+
+        return sum(
+            max(0, lot.quantity)
+            for lot in self.lots
+            if lot.quantity > 0
+            and lot.available_date <= day
+            and float(price) > lot.price
         )
 
     def quantity_before(self, day: str) -> int:
@@ -95,6 +109,49 @@ class PositionBook:
                     "allocated_fees": allocated_fees,
                     "holding_days": max(
                         0, (date.fromisoformat(day) - date.fromisoformat(lot.buy_date)).days
+                    ),
+                }
+            )
+        self.lots = [lot for lot in self.lots if lot.quantity > 0]
+        return quantity - remaining, allocations
+
+    def sell_profitable(
+        self, quantity: int, price: float, day: str
+    ) -> Tuple[int, List[Dict[str, Any]]]:
+        """Sell only available lots with a buy price below current price."""
+
+        remaining = max(0, int(quantity))
+        allocations: List[Dict[str, Any]] = []
+        for lot in self.lots:
+            if remaining <= 0:
+                break
+            if (
+                lot.quantity <= 0
+                or lot.available_date > day
+                or float(price) <= lot.price
+            ):
+                continue
+            sold = min(lot.quantity, remaining)
+            unit_cost = lot.cost / lot.quantity
+            allocated_cost = unit_cost * sold
+            allocated_fees = (lot.fees / lot.quantity) * sold
+            lot.quantity -= sold
+            lot.cost -= allocated_cost
+            lot.fees -= allocated_fees
+            remaining -= sold
+            allocations.append(
+                {
+                    "lot_id": lot.lot_id,
+                    "buy_date": lot.buy_date,
+                    "quantity": sold,
+                    "allocated_cost": allocated_cost,
+                    "allocated_fees": allocated_fees,
+                    "holding_days": max(
+                        0,
+                        (
+                            date.fromisoformat(day)
+                            - date.fromisoformat(lot.buy_date)
+                        ).days,
                     ),
                 }
             )
@@ -525,8 +582,12 @@ class BacktestEngine:
         cash = float(allocation)
         core_initialized = False
         triggered_levels = set()
+        recovery_tracker: Dict[str, Any] = {}
         layered_sizing = spec.position_sizing or {}
         ladder_enabled = bool(layered_sizing.get("drawdown_ladder"))
+        fibonacci_enabled = bool(layered_sizing.get("fibonacci_ladder"))
+        exit_mode = str(layered_sizing.get("exit_mode", "rsi"))
+        sell_basis = str(layered_sizing.get("sell_basis", "all_tactical"))
         core_config = layered_sizing.get("core") or {}
         core_ratio = float(core_config.get("ratio", 0.0))
         trades: List[Dict[str, Any]] = []
@@ -544,25 +605,93 @@ class BacktestEngine:
             suspended = bool(bar.get("suspended") or bar.get("is_suspended"))
             ladder_state = None
             ladder_result = {"ladder_amount": 0.0, "new_levels": []}
+            fibonacci_state = None
+            fibonacci_result = {"ladder_amount": 0.0, "new_levels": []}
             if ladder_enabled:
                 ladder_state = build_ladder_state(spec, bars, index)
                 ladder_result = resolve_ladder_level(
                     spec, ladder_state, triggered_levels, consume=False
                 )
                 triggered_levels = set(ladder_result["triggered_levels"])
+            elif fibonacci_enabled:
+                fibonacci_state = build_fibonacci_state(spec, bars, index)
+                fibonacci_result = resolve_fibonacci_level(spec, fibonacci_state)
 
             if suspended:
                 warnings.append("{} {} 鍋滅墝锛屾棤娉曚骇鐢熸垨鎵ц浜ゆ槗".format(code, day))
             else:
+                if exit_mode == "recovery" and ladder_state is not None:
+                    recovery_result = resolve_recovery_levels(
+                        ladder_state, recovery_tracker
+                    )
+                    recovery_tracker = recovery_result["tracker"]
+                    ladder = layered_sizing.get("drawdown_ladder") or {}
+                    amounts = [float(value) for value in ladder.get("amounts", [])]
+                    for level in recovery_result["sell_levels"]:
+                        amount = amounts[level - 1] if level <= len(amounts) else 0.0
+                        requested_quantity = _recovery_sell_quantity(
+                            amount, float(bar["close"]), lot_size
+                        )
+                        signal_evidence = {
+                            "signal_date": day,
+                            "data_as_of": day,
+                            "book": "tactical",
+                            "recovery": {
+                                "level": level,
+                                "cash_amount": amount,
+                                "requested_quantity": requested_quantity,
+                                "state": ladder_state,
+                                "tracker": recovery_result,
+                            },
+                        }
+                        order_number += 1
+                        trade, cash, flow, order_warnings = self._execute_order(
+                            spec,
+                            code,
+                            bar,
+                            PendingOrder(
+                                code=code,
+                                side="SELL",
+                                source="RECOVERY_SELL",
+                                signal_date=day,
+                                execute_date=day,
+                                reason="RECOVERY_RULE",
+                                config={
+                                    "lot_size": lot_size,
+                                    "signal_evidence": signal_evidence,
+                                    "cost_basis": "weighted_average",
+                                },
+                                requested_quantity=requested_quantity,
+                                intraday_price=float(bar["close"]),
+                            ),
+                            tactical_book,
+                            cash,
+                            allocation,
+                            lot_size,
+                            next_day,
+                            order_number,
+                        )
+                        trade["book"] = "tactical"
+                        trades.append(trade)
+                        warnings.extend(order_warnings)
+                        if flow:
+                            cash_flows.append(flow)
+
+                exit_quantity = _layered_exit_quantity(
+                    sell_basis,
+                    tactical_book,
+                    day,
+                    float(bar["close"]),
+                )
                 plan = build_signal_plan(
                     spec,
                     bars,
                     index,
-                    tactical_book.total_quantity(),
+                    exit_quantity,
                     indicator_series=indicator_series,
                 )
 
-                if plan["entry_count"] >= 1 and not core_initialized:
+                if plan["entry_count"] >= 1 and not core_initialized and core_ratio > 0:
                     core_initialized = True
                     core_cash = max(0.0, float(allocation) * core_ratio)
                     core_evidence = dict(plan["evidence"])
@@ -624,6 +753,16 @@ class BacktestEngine:
                             "triggered_levels": ladder_result["triggered_levels"],
                             "ladder_amount": ladder_result["ladder_amount"],
                         }
+                    elif fibonacci_state is not None:
+                        buy_cash = resolve_tactical_cash(
+                            buy_cash, fibonacci_result["ladder_amount"]
+                        )
+                        signal_evidence["fibonacci"] = {
+                            "state": fibonacci_state,
+                            "new_levels": fibonacci_result["new_levels"],
+                            "level": fibonacci_result["level"],
+                            "ladder_amount": fibonacci_result["ladder_amount"],
+                        }
                     signal_evidence["book"] = "tactical"
                     signal_evidence["rsi_cash"] = float(plan["buy_cash"])
                     signal_evidence["buy_cash"] = buy_cash
@@ -660,10 +799,18 @@ class BacktestEngine:
                     warnings.extend(order_warnings)
                     if flow:
                         cash_flows.append(flow)
-                elif plan["action"] == "SELL":
+                elif plan["action"] == "SELL" and exit_mode == "rsi":
                     signal_evidence = dict(plan["evidence"])
                     signal_evidence["book"] = "tactical"
                     signal_evidence["sell_quantity"] = plan["sell_quantity"]
+                    signal_evidence["sell_basis"] = sell_basis
+                    signal_evidence["profit_tactical_quantity"] = (
+                        tactical_book.available_profitable_quantity(
+                            float(bar["close"]), day
+                        )
+                        if sell_basis == "profitable_tactical"
+                        else None
+                    )
                     order_number += 1
                     trade, cash, flow, order_warnings = self._execute_order(
                         spec,
@@ -680,6 +827,7 @@ class BacktestEngine:
                                 "lot_size": lot_size,
                                 "signal_evidence": signal_evidence,
                                 "cost_basis": "weighted_average",
+                                "sell_basis": sell_basis,
                             },
                             requested_quantity=plan["sell_quantity"],
                             intraday_price=float(bar["close"]),
@@ -696,6 +844,15 @@ class BacktestEngine:
                     warnings.extend(order_warnings)
                     if flow:
                         cash_flows.append(flow)
+                elif plan["action"] == "SELL" and exit_mode == "recovery":
+                    skipped_sell_signals.append(
+                        {
+                            "signal_date": day,
+                            "exit_count": plan["exit_count"],
+                            "tactical_quantity": tactical_book.total_quantity(),
+                            "reason": "RSI_EXIT_DISABLED_BY_RECOVERY_MODE",
+                        }
+                    )
                 elif plan["exit_count"] > 0:
                     skipped_sell_signals.append(
                         {
@@ -1022,6 +1179,10 @@ class BacktestEngine:
         order_id = "{}-{}-{}".format(code, day, order_number)
         position_before = book.total_quantity()
         available_before = book.available_quantity(day)
+        sell_basis = str(order_config.get("sell_basis", "all_tactical"))
+        sell_available_before = available_before
+        if order.side == "SELL" and sell_basis == "profitable_tactical":
+            sell_available_before = book.available_profitable_quantity(raw_price, day)
         requested_sell = order.requested_quantity
         if order.side == "SELL" and requested_sell is None:
             requested_sell = _sell_quantity(spec, book, day, lot_size)
@@ -1185,7 +1346,7 @@ class BacktestEngine:
             return trade, cash, flow, warnings
 
         requested = requested_sell
-        if requested <= 0 or available_before <= 0:
+        if requested <= 0 or sell_available_before <= 0:
             return (
                 _unfilled_trade(
                     code,
@@ -1201,6 +1362,7 @@ class BacktestEngine:
                     position_before=position_before,
                     position_after=position_before,
                     available_quantity_before=available_before,
+                    eligible_quantity_before=sell_available_before,
                     cash_before=cash_before,
                     cash_after=cash,
                 ),
@@ -1208,7 +1370,7 @@ class BacktestEngine:
                 flow,
                 ["{} {} 没有可卖持仓".format(code, day)],
             )
-        target_quantity = floor(min(requested, available_before) / lot_size) * lot_size
+        target_quantity = floor(min(requested, sell_available_before) / lot_size) * lot_size
         if target_quantity <= 0:
             return (
                 _unfilled_trade(
@@ -1225,6 +1387,7 @@ class BacktestEngine:
                     position_before=position_before,
                     position_after=position_before,
                     available_quantity_before=available_before,
+                    eligible_quantity_before=sell_available_before,
                     cash_before=cash_before,
                     cash_after=cash,
                 ),
@@ -1234,13 +1397,22 @@ class BacktestEngine:
             )
         fill_price = raw_price * (1 - float(rates["slippage_rate"]))
         average_cost_before = book.average_cost()
-        actual, allocations = book.sell(target_quantity, day)
+        if sell_basis == "profitable_tactical":
+            actual, allocations = book.sell_profitable(
+                target_quantity, raw_price, day
+            )
+        else:
+            actual, allocations = book.sell(target_quantity, day)
         gross = actual * fill_price
         fee_breakdown = _fee_breakdown(rates, fill_price, actual, gross, side="SELL")
         fee = sum(fee_breakdown.values())
         revenue = gross - fee
         cash += revenue
-        if order_config.get("cost_basis") == "weighted_average" and average_cost_before is not None:
+        if (
+            order_config.get("cost_basis") == "weighted_average"
+            and sell_basis != "profitable_tactical"
+            and average_cost_before is not None
+        ):
             allocated_cost = average_cost_before * actual
         else:
             allocated_cost = sum(item["allocated_cost"] for item in allocations)
@@ -1274,6 +1446,7 @@ class BacktestEngine:
             "position_before": position_before,
             "position_after": book.total_quantity(),
             "available_quantity_before": available_before,
+            "eligible_quantity_before": sell_available_before,
             "cash_before": cash_before,
             "cash_after": round(cash, 8),
             "lot_ids": [item["lot_id"] for item in allocations],
@@ -1499,6 +1672,18 @@ def _buy_requested_quantity(config, lot_size):
         return 0
 
 
+def _recovery_sell_quantity(amount, price, lot_size):
+    if float(amount) <= 0 or float(price) <= 0:
+        return 0
+    return floor(float(amount) / float(price) / lot_size) * lot_size
+
+
+def _layered_exit_quantity(sell_basis, book, day, price):
+    if sell_basis == "profitable_tactical":
+        return book.available_profitable_quantity(price, day)
+    return book.total_quantity()
+
+
 def _buy_target_cash(config, cash, allocation):
     kind = str(config.get("type", "all_in"))
     if kind == "recurrent_cash":
@@ -1551,7 +1736,9 @@ def _uses_close_execution(spec):
 def _uses_layered_close_execution(spec):
     sizing = spec.position_sizing or {}
     return _uses_close_execution(spec) and bool(
-        sizing.get("core") or sizing.get("drawdown_ladder")
+        sizing.get("core")
+        or sizing.get("drawdown_ladder")
+        or sizing.get("fibonacci_ladder")
     )
 
 
@@ -1754,10 +1941,17 @@ def _provenance(spec, data, actions):
         "cost_profile": _cost_profile(spec, include_defaults=True),
     }
     sizing = spec.position_sizing or {}
-    if sizing.get("core") or sizing.get("drawdown_ladder"):
+    if (
+        sizing.get("core")
+        or sizing.get("drawdown_ladder")
+        or sizing.get("fibonacci_ladder")
+    ):
         provenance["layered"] = {
+            "exit_mode": str(sizing.get("exit_mode", "rsi")),
+            "sell_basis": str(sizing.get("sell_basis", "all_tactical")),
             "core": dict(sizing.get("core") or {}),
             "drawdown_ladder": dict(sizing.get("drawdown_ladder") or {}),
+            "fibonacci_ladder": dict(sizing.get("fibonacci_ladder") or {}),
         }
     return provenance
 

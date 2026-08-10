@@ -164,6 +164,7 @@ def _markdown_report(
     lines.extend(_trade_section(result))
     layered = provenance.get("layered") or {}
     ladder = layered.get("drawdown_ladder") or {}
+    fibonacci = layered.get("fibonacci_ladder") or {}
     if layered:
         core = layered.get("core") or {}
         lines.extend(
@@ -171,15 +172,26 @@ def _markdown_report(
                 "",
                 "### Ladder assumptions",
                 "",
+                "- Exit mode: {}.".format(layered.get("exit_mode", "rsi")),
+                "- Sell basis: {}.".format(layered.get("sell_basis", "all_tactical")),
                 "- Core ratio: {}; trigger: {}; hold: {}.".format(
                     core.get("ratio"), core.get("trigger"), core.get("hold")
                 ),
-                "- Drawdown ladder: anchor window {}; thresholds {}; amounts {}; MA{} boost +1/+2; combine {}.".format(
-                    ladder.get("anchor_window"),
-                    ladder.get("thresholds"),
-                    ladder.get("amounts"),
-                    ladder.get("annual_period"),
-                    ladder.get("combine", "max"),
+                (
+                    "- Drawdown ladder: anchor window {}; thresholds {}; amounts {}; MA{} boost +1/+2; combine {}.".format(
+                        ladder.get("anchor_window"),
+                        ladder.get("thresholds"),
+                        ladder.get("amounts"),
+                        ladder.get("annual_period"),
+                        ladder.get("combine", "max"),
+                    )
+                    if ladder
+                    else "- Fibonacci ladder: prior {} completed bars; ratios {}; amounts {}; crossing {}.".format(
+                        fibonacci.get("anchor_window"),
+                        fibonacci.get("ratios"),
+                        fibonacci.get("amounts"),
+                        fibonacci.get("crossing", "first_close_below"),
+                    )
                 ),
             ]
         )
@@ -249,6 +261,21 @@ def _trade_section(result):
                     _percent(metrics.get("time_in_market_ratio")),
                     _money(metrics.get("current_cash")),
                     _money(metrics.get("current_market_value")),
+                ),
+                "- Cash-neutral XIRR: cumulative {}; annualized {}; active sessions {}.".format(
+                    _percent(metrics.get("cash_neutral_cumulative_return")),
+                    _percent(metrics.get("cash_neutral_annualized_return")),
+                    metrics.get("cash_neutral_active_sessions", "unavailable"),
+                ),
+                "- Cash-neutral TWR: cumulative {}; annualized {}; active calendar days {}; max drawdown {}; peak {}; trough {}; recovery {}.".format(
+                    _percent(metrics.get("cash_neutral_twr_cumulative_return")),
+                    _percent(metrics.get("cash_neutral_twr_annualized_return")),
+                    metrics.get("cash_neutral_active_calendar_days", "unavailable"),
+                    _percent(metrics.get("cash_neutral_max_drawdown")),
+                    metrics.get("cash_neutral_max_drawdown_peak_date", "unavailable"),
+                    metrics.get("cash_neutral_max_drawdown_trough_date", "unavailable"),
+                    metrics.get("cash_neutral_max_drawdown_recovery_date")
+                    or "not recovered by end",
                 ),
                 "- 当前持仓数量：{}；可卖数量：{}".format(
                     metrics.get("current_position_quantity", "不可用"),
