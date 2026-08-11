@@ -64,3 +64,42 @@ def test_weekly_rsi_uses_previous_completed_week_until_week_end():
     friday_of_last_week = monday_of_last_week + 4
     assert series[monday_of_last_week] == 100.0
     assert series[friday_of_last_week] < 100.0
+
+
+def test_sentiment_indicator_reads_date_aligned_factor_from_bar():
+    spec = StrategySpec.from_dict(
+        {
+            "strategy_id": "sentiment-indicator",
+            "version": "1.0.0",
+            "name": "sentiment indicator",
+            "universe": ["512890"],
+            "frequency": "1d",
+            "entry": {"rules": []},
+            "exit": {"rules": []},
+            "position_sizing": {"type": "all_in"},
+            "indicators": [
+                {
+                    "id": "news_sentiment_5d",
+                    "type": "sentiment",
+                    "factor": "news_event_sentiment",
+                    "scope": "instrument",
+                    "horizon": 5,
+                    "representation": "percentile",
+                    "cutoff": "15:00",
+                    "profile": "sentiment-baseline-v1",
+                }
+            ],
+        }
+    )
+    bars = [
+        {
+            "date": "2026-08-10",
+            "open": 1,
+            "high": 1,
+            "low": 1,
+            "close": 1,
+            "sentiment_factors": {"news_event_sentiment": {"percentile": 0.75}},
+        }
+    ]
+
+    assert build_indicator_series(spec, bars)["news_sentiment_5d"] == [0.75]

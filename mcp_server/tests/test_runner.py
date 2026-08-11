@@ -191,3 +191,21 @@ def test_runner_includes_strategy_signal_and_writes_local_report(tmp_path):
     report_path = tmp_path / "reports" / "daily" / "2026-08-10.md"
     assert report_path.exists()
     assert "test-strategy" in report_path.read_text(encoding="utf-8")
+
+
+def test_runner_uses_actual_noon_collection_time_as_quote_cutoff(tmp_path):
+    store = SQLiteStore(tmp_path / "research.sqlite3")
+    store.initialize()
+    store.add_watchlist_item("512890", instrument_type="ETF")
+    provider = FakeMarketProvider()
+    runner = DailyReportRunner(
+        store=store,
+        market_provider=provider,
+        calendar=TradingCalendar(),
+        now_fn=lambda: datetime(2026, 8, 10, 12, 0, 10),
+    )
+
+    result = runner.run(date(2026, 8, 10), send=False)
+
+    assert result.status == "previewed"
+    assert provider.calls[0][1] == "午间行情 12:00"

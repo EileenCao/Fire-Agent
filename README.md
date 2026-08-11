@@ -2,9 +2,9 @@
 
 > 重要：本项目的真实 A 股数据依赖 `a-stock-data` Skill。未安装或版本不满足时，项目不能运行真实数据功能；项目不会静默切换到其他数据源。
 
-FireAgent 以 Agent 对话为入口，用三个 Skill 帮助用户澄清策略、运行回测和进行日维度观察；确定性计算、数据证据、结果保存由本地 MCP 服务和回测引擎完成。
+FireAgent 以 Agent 对话为入口，用六个 Skill 帮助用户研究标的、澄清策略、运行回测、分析情绪因子和进行日维度观察；确定性计算、数据证据、结果保存由本地 MCP 服务和回测引擎完成。
 
-项目根目录的 `AGENTS.md` 负责把对话任务路由到项目内的三个 Skill。Skill 文档修改后会在下一次 Agent 任务中按项目路径读取，不需要复制到 Codex 用户 Skill 目录。
+项目根目录的 `AGENTS.md` 负责把对话任务路由到项目内的六个 Skill。Skill 文档修改后会在下一次 Agent 任务中按项目路径读取，不需要复制到 Codex 用户 Skill 目录。
 
 项目当前定位是本地研究工具：不自动下单，不连接券商交易接口；不需要 Ollama；飞书仅作为可选的单向午间日报渠道，不支持飞书内双向 Agent 对话。
 
@@ -153,7 +153,7 @@ python -m mcp_server.cli doctor
 代码修改后不需要重新安装 Skill，也不需要反复修改全局 Codex MCP 配置。运行下面的命令会：
 
 - 检查 `a-stock-data` 版本和路径；
-- 检查三个项目 Skill；
+- 检查六个项目 Skill；
 - 生成项目级 `.codex/config.toml`；
 - 固定当前 Python、项目目录、独立工作区、数据库和交易日历路径；
 - 不覆盖独立工作区中的 Feishu 配置；是否启用由工作区 `config/.env` 控制。
@@ -286,7 +286,51 @@ python -m mcp_server.cli render-backtest-report `
   --risk-free-rate-annual 0.02
 ```
 
-### 6. 启动 MCP stdio 服务
+### 6. 使用 Agent 生成标的研究卡
+
+研究卡默认读取 `a-stock-data`，先生成确定性事实和字段级证据，再由 Agent 解读。它支持股票和 ETF；缺失、过期、来源冲突和接口失败会保留在结果中，不会用零值静默填充。研究刷新会生成新的快照，不覆盖历史快照。
+
+可以直接在已接入 FireAgent MCP 的对话中发送：
+
+```text
+分析 512890
+结合我的策略分析 512890
+启用多角色分析
+查看这次研究的证据
+```
+
+对应的确定性 MCP 工具包括：`research_instrument`、`get_market_data`、`get_fundamentals`、`get_valuation`、`score_instrument`、`get_research_context`、`save_research_analysis`、`get_research_snapshot`、`list_research_snapshots` 和 `get_research_evidence`。
+
+也可以在项目根目录用 CLI 做一次本地验证；不写 `--data` 时由 `a-stock-data` 自动准备行情和历史日线：
+
+```powershell
+python -m mcp_server.cli research 512890
+python -m mcp_server.cli research-list --code 512890
+```
+
+需要显式带入观察清单或长期记忆时，可加 `--include-watchlist`、`--include-memory` 和可选的 `--memory-query`；它们只作为上下文，不会改变研究事实。
+
+研究产物位于用户独立工作区的 `artifacts/research/<时间>_<市场代码>_research_run-<id>/`，包含 `report.md`、不可由 AI 修改的 `snapshot.json`、`evidence.json`、`analysis.json` 和可选的 `charts/price_technical.png`。其它 Provider 只能通过明确的 `provider_id` 选择，不能静默替换 `a-stock-data`。
+
+### 7. 使用 Agent 研究新闻与博主情绪
+
+情绪研究默认使用已安装的 `a-stock-data` 获取财经新闻；雪球、养基宝、小红书和支付宝等受限来源需要用户投递链接、文本或截图，系统不会模拟登录、绕过验证码或保存平台凭据。先让 Agent 配置来源，再抽取和聚合：
+
+```text
+配置东方财富新闻和我的雪球白名单作者。
+分析 512890 最近的新闻和博主情绪，先只做确定性证据包。
+查看 512890 的 1、5、20 日情绪因子和来源分解。
+把这条博主策略整理成候选回测策略，列出明确规则、缺失规则和证据，不要保存。
+查看这次情绪快照的证据。
+```
+
+Agent 应按以下 MCP 顺序工作：`sentiment_source_upsert` → `collect_sentiment_documents` 或 `ingest_sentiment_document` → `get_sentiment_extraction_context` → `save_sentiment_extraction` → `build_sentiment_snapshot` → `get_sentiment_snapshot`/`get_sentiment_evidence`。来源配置中的 `provider_id` 必须显式填写 `a-stock-data` 或 `public-web`；`public-web` 只读取用户明确配置的公开 RSS/Atom URL。情绪抽取由当前对话中的 Agent 完成，不需要 Ollama 或后台模型 API。
+
+每条内容只保存摘要、URL、内容哈希、事件指纹和结构化抽取；不保存完整原文。重复 URL/哈希/事件指纹不会重复计分。每个交易日以 Asia/Shanghai 15:00 为信息截止时间，生成 1/5/20 日序列；没有内容、基准、样本或来源失败时显示 `missing`/“不可用”，不会填零。目标区间覆盖率低于 50% 或有效快照少于 20 个时，只允许探索性情绪回测，不能激活策略。
+
+情绪产物位于工作区 `artifacts/sentiment/<时间>_<范围>_<profile>_run-<id>/`，包含 `report.md`、不可由 AI 修改的 `snapshot.json`、`evidence.json`、`author_performance.json`、`factor_series.parquet` 和可选 PNG 图表。将情绪用于策略时，策略必须明确 `factor`、`scope`、`horizon`、`representation`、`cutoff`、缺失处理、仓位、成本、基准和无风险利率；博主策略只能先生成候选，用户批准完整 diff 后才能保存和回测。
+
+### 8. 启动 MCP stdio 服务
 
 在支持 MCP stdio 的 Agent 中，把启动命令配置为：
 
@@ -317,6 +361,30 @@ prepare_strategy_revision
 compare_backtests
 observe_active_strategy
 get_signal_evidence
+research_instrument
+get_market_data
+get_fundamentals
+get_valuation
+score_instrument
+get_research_context
+save_research_analysis
+get_research_snapshot
+list_research_snapshots
+get_research_evidence
+sentiment_source_upsert
+sentiment_source_list
+sentiment_source_deactivate
+collect_sentiment_documents
+ingest_sentiment_document
+get_sentiment_extraction_context
+save_sentiment_extraction
+backfill_sentiment_data
+build_sentiment_snapshot
+get_sentiment_snapshot
+list_sentiment_snapshots
+get_sentiment_evidence
+evaluate_sentiment_authors
+prepare_strategy_candidate_from_opinion
 watchlist_add
 watchlist_remove
 watchlist_list
@@ -338,7 +406,7 @@ import_memories
 
 如果没有工具列表或提示 MCP 未连接，先在项目根目录运行 `python -m mcp_server.cli sync`，然后重启 MCP 或新开 Codex 任务再验证。
 
-服务启动时会先检查 `a-stock-data`。可用工具包括策略校验与版本管理、数据准备、回测、结果比较、日观察、信号证据和观察清单管理。通知工具保留接口但默认关闭。
+服务启动时会先检查 `a-stock-data`。可用工具包括策略校验与版本管理、数据准备、回测、结果比较、日观察、信号证据、观察清单和情绪来源/抽取/快照管理。通知工具保留接口但默认关闭。
 
 省略 `data` 调用 `prepare_backtest_data` 或 `run_backtest` 时，Provider 会自动把原始快照写入工作区 `data/raw/`，把可复用日线写入 `data/parquet/`；SQLite 只保存运行元数据和证据，不承载历史 K 线本体。需要自定义缓存位置时，MCP 仍可传 `cache_dir`。
 
@@ -362,6 +430,8 @@ python -m pytest -q
 7. 如果要调整策略，先用 `prepare_strategy_revision` 展示完整逐字段 diff，逐项与用户讨论，用户明确批准完整 diff 后才保存新版本；
 8. 用户确认实验和新的 benchmark、无风险利率、成本、仓位后才运行新回测；
 9. `daily-strategy-observer` 在日维度输出规则信号和证据，AI 观察单独成栏，不修改规则结果。
+
+标的研究的推荐顺序是：先说“分析 512890”，确认标的和数据截止时间；需要策略联动时再说“结合我的策略分析 512890”；只有明确说“启用多角色分析”才启用多个分析角色；最后说“查看这次研究的证据”，Agent 应返回合法的 `evidence_id`、来源和数据时间。研究分析不能改写确定性快照，也不能自动下单。
 
 系统只提供研究建议和证据，不自动下单，也不把“回测结果好”自动标成策略通过。
 
@@ -396,7 +466,9 @@ FireAgent/
 │  ├─ strategy-workbench/SKILL.md
 │  ├─ backtest-analysis/SKILL.md
 │  ├─ daily-strategy-observer/SKILL.md
-│  └─ user-memory/SKILL.md
+│  ├─ stock-research/SKILL.md
+│  ├─ user-memory/SKILL.md
+│  └─ sentiment-research/SKILL.md
 ├─ scripts/
 │  ├─ sync.ps1.example               # PowerShell 示例；实际脚本本地忽略
 │  └─ sync.sh.example                # Git Bash/WSL 示例；实际脚本本地忽略
@@ -412,11 +484,18 @@ FireAgent/
    │  └─ strategy.py                  # StrategySpec 与版本契约
    ├─ adapters/
    │  ├─ a_stock_data.py             # a-stock-data 行情适配层
+   │  ├─ instrument_research.py     # 标的研究 Provider
    │  └─ feishu.py                   # 飞书 Webhook 适配器，默认关闭
    ├─ services/
    │  ├─ backtesting.py               # 确定性回测引擎
    │  ├─ historical_data.py           # a-stock-data 历史日线 Provider 与缓存
    │  ├─ observer.py                  # 日规则观察
+   │  ├─ research.py                  # 研究事实、技术指标和 baseline-v1 评分
+   │  ├─ research_artifacts.py        # 研究卡 JSON、Markdown 和图表
+   │  ├─ sentiment.py                 # 情绪抽取与确定性因子聚合
+   │  ├─ sentiment_backtest.py        # 情绪快照按日期接入回测日线
+   │  ├─ sentiment_artifacts.py       # 情绪快照 JSON、Parquet、Markdown 和图表
+   │  ├─ provider_registry.py         # 显式 Provider 选择
    │  ├─ plugin_runner.py              # 审批后的 Python 插件隔离运行
    │  ├─ reporting.py                 # 午间观察报告
    │  └─ artifacts.py                 # JSON、Markdown、CSV 产物
@@ -439,7 +518,7 @@ FireAgent/
 
 ### SQLite 记录
 
-本地数据库默认在用户确认的独立工作区 `stock_research.sqlite3`，包括观察清单、通知配置、报告运行、投递尝试、策略版本、回测运行、信号证据和版本化长期记忆。长期记忆支持 FTS5 搜索、三级范围、用户确认后替代、归档、永久删除及 JSON 导入导出。真实数据缓存、记忆导出和报告产物也在该工作区，不应提交 Git；Webhook 地址和签名密钥只从环境变量或未提交 `.env` 读取，不能写入数据库、日志或报告。
+本地数据库默认在用户确认的独立工作区 `stock_research.sqlite3`，包括观察清单、通知配置、报告运行、投递尝试、策略版本、回测运行、信号证据、研究快照/证据和版本化长期记忆。长期记忆支持 FTS5 搜索、三级范围、用户确认后替代、归档、永久删除及 JSON 导入导出。研究快照中的确定性事实与 AI 分析分离保存；刷新只创建新快照。真实数据缓存、记忆导出和报告产物也在该工作区，不应提交 Git；Webhook 地址和签名密钥只从环境变量或未提交 `.env` 读取，不能写入数据库、日志或报告。
 
 ### 扩展方式
 
@@ -463,7 +542,7 @@ python -m mcp_server.cli doctor
 
 ### `sync` 报告找不到项目 Skill
 
-确认 `skills/strategy-workbench/SKILL.md`、`skills/backtest-analysis/SKILL.md`、`skills/daily-strategy-observer/SKILL.md` 和 `skills/user-memory/SKILL.md` 都存在，并且 frontmatter 的 `name` 与目录名一致。
+确认 `skills/strategy-workbench/SKILL.md`、`skills/backtest-analysis/SKILL.md`、`skills/daily-strategy-observer/SKILL.md`、`skills/stock-research/SKILL.md`、`skills/user-memory/SKILL.md` 和 `skills/sentiment-research/SKILL.md` 都存在，并且 frontmatter 的 `name` 与目录名一致。
 
 ### 长期记忆无法保存或搜索
 

@@ -32,6 +32,8 @@ def test_mcp_catalog_exposes_watchlist_and_notification_tools(tmp_path):
         "get_backtest_result",
         "compare_backtests",
         "observe_active_strategy",
+        "update_external_position",
+        "get_external_position",
         "get_signal_evidence",
         "watchlist_add",
         "watchlist_remove",
@@ -59,6 +61,22 @@ def test_mcp_watchlist_call_returns_structured_result(tmp_path):
     assert result["isError"] is False
     assert result["structuredContent"]["item"]["code"] == "512890"
     assert result["structuredContent"]["item"]["instrument_type"] == "ETF"
+
+
+def test_mcp_external_position_update_is_workspace_only(tmp_path):
+    store = SQLiteStore(tmp_path / "research.sqlite3")
+    store.initialize()
+    app = McpApplication(store=store)
+
+    result = app.call_tool(
+        "update_external_position",
+        {"market_value": 31033, "unrealized_pnl": 18, "as_of": "2026-08-11T11:30:00+08:00"},
+    )
+    loaded = app.call_tool("get_external_position", {})
+
+    assert result["isError"] is False
+    assert result["structuredContent"]["position"]["market_value"] == 31033.0
+    assert loaded["structuredContent"]["position"]["unrealized_pnl"] == 18.0
 
 
 def test_mcp_can_validate_save_and_activate_strategy(tmp_path):

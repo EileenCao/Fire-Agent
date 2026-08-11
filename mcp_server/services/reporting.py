@@ -25,7 +25,7 @@ class DailyReportBuilder:
         lines = [
             "# A股午间观察日报",
             "",
-            "> 日期：{}；截至{}；本报告只使用上午盘数据。".format(
+            "> 日期：{}；数据截止{}；本报告使用截止时刻前可获得的午间行情。".format(
                 report_date.isoformat(), cutoff
             ),
             "",
@@ -78,6 +78,8 @@ def _render_strategy_signal(signal: dict) -> List[str]:
     details = signal.get("signal") or {}
     state = signal.get("state") or {}
     evidence = details.get("evidence") or {}
+    external = signal.get("external_position")
+    ladder_state = (evidence.get("ladder") or {}).get("state") or {}
     lines = [
         "- 标的：{}；动作：{}；状态：{}".format(
             signal.get("code", "512890"), action, status
@@ -92,6 +94,37 @@ def _render_strategy_signal(signal: dict) -> List[str]:
             state.get("total_quantity", "不可用"),
         ),
     ]
+    if external:
+        lines.extend(
+            [
+                "- 真实外部持仓：{}；市值：{}元；盈亏：{}元；更新：{}".format(
+                    external.get("vehicle", "未知载体"),
+                    external.get("market_value", "不可用"),
+                    external.get("unrealized_pnl", "不可用"),
+                    external.get("as_of", "不可用"),
+                ),
+                "- 执行约束：场外基金直接复制 512890；申赎截止：{}；需人工操作".format(
+                    external.get("cutoff_time", "未知")
+                ),
+            ]
+        )
+    else:
+        lines.append("- 真实外部持仓：UNDETERMINED；未找到工作区确认快照")
+    anchor_price = ladder_state.get("anchor_price")
+    current_close = ladder_state.get("current_close")
+    drawdown_pct = ladder_state.get("drawdown_pct")
+    history_count = ladder_state.get("history_count")
+    if anchor_price is not None and current_close is not None and drawdown_pct is not None:
+        lines.append(
+            "- 最高点回撤（策略前序窗口）：峰值：{:.3f}元；当前：{:.3f}元；回撤：{:.2f}%；样本：{}个交易日".format(
+                float(anchor_price),
+                float(current_close),
+                float(drawdown_pct) * 100,
+                history_count if history_count is not None else "不可用",
+            )
+        )
+    else:
+        lines.append("- 最高点回撤（策略前序窗口）：数据不足")
     if evidence.get("indicator_values"):
         lines.append("- 指标：{}".format(evidence["indicator_values"]))
     if evidence.get("morning_price") is not None:

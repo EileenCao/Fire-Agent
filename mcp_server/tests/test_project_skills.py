@@ -6,7 +6,9 @@ SKILLS = {
     "strategy-workbench": "将自然语言策略",
     "backtest-analysis": "分析已保存的回测",
     "daily-strategy-observer": "生成日维度",
+    "stock-research": "单标的研究卡",
     "user-memory": "用户长期记忆",
+    "sentiment-research": "新闻与博主情绪研究",
 }
 
 

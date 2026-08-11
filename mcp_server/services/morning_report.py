@@ -13,6 +13,7 @@ def build_morning_strategy_signal_builder(
     strategy_path: Path,
     historical_provider,
     evaluator: Optional[MorningStrategySignalEvaluator] = None,
+    external_position_provider=None,
 ):
     """Return a report callback backed by one explicit, immutable strategy file."""
 
@@ -24,6 +25,11 @@ def build_morning_strategy_signal_builder(
         snapshot_by_code = {item.code: item for item in snapshots}
         results = []
         for code in spec.universe:
+            external_position = (
+                external_position_provider(code)
+                if external_position_provider is not None
+                else None
+            )
             snapshot = snapshot_by_code.get(code)
             if snapshot is None or snapshot.price is None:
                 results.append(
@@ -35,6 +41,7 @@ def build_morning_strategy_signal_builder(
                         "strategy_id": spec.strategy_id,
                         "strategy_version": spec.version,
                         "error": "上午行情价格不可用",
+                        "external_position": external_position,
                     }
                 )
                 continue
@@ -56,6 +63,7 @@ def build_morning_strategy_signal_builder(
                         "strategy_id": spec.strategy_id,
                         "strategy_version": spec.version,
                         "error": "历史日线不可用",
+                        "external_position": external_position,
                     }
                 )
                 continue
@@ -67,6 +75,7 @@ def build_morning_strategy_signal_builder(
                 morning_price=float(snapshot.price),
                 data_as_of=as_of,
             )
+            result["external_position"] = external_position
             results.append(result)
         return results
 

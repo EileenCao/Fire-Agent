@@ -11,6 +11,12 @@ def test_readme_is_windows_first_and_declares_runtime_contract():
     assert "validate-strategy" in content
     assert "run-backtest" in content
     assert "user-memory" in content
+    assert "stock-research" in content
+    assert "research_instrument" in content
+    assert "分析 512890" in content
+    assert "结合我的策略分析 512890" in content
+    assert "启用多角色分析" in content
+    assert "查看这次研究的证据" in content
     assert "prepare_memory" in content
     assert "save_memory" in content
     assert "memory-export" in content

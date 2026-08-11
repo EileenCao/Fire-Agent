@@ -402,6 +402,9 @@ def _validate_rsi_contract(payload, indicators, sizing):
         elif indicator_id in ids:
             errors.append("indicators id 不能重复：{}".format(indicator_id))
         ids.append(indicator_id)
+        if item.get("type") == "sentiment":
+            errors.extend(_validate_sentiment_indicator(item))
+            continue
         if item.get("type") != "rsi":
             errors.append("仅支持 RSI 指标")
         if item.get("timeframe") not in {"1d", "1w"}:
@@ -429,6 +432,27 @@ def _validate_rsi_contract(payload, indicators, sizing):
         )
     if sizing and sizing.get("type") != "recurrent_cash":
         errors.append("count_conditions 策略必须使用 recurrent_cash 仓位类型")
+    return errors
+
+
+def _validate_sentiment_indicator(item):
+    errors = []
+    if not item.get("factor"):
+        errors.append("sentiment indicator requires factor")
+    if item.get("scope", "instrument") not in {"instrument", "market", "industry"}:
+        errors.append("sentiment scope must be instrument, market, or industry")
+    try:
+        horizon = int(item.get("horizon"))
+    except (TypeError, ValueError):
+        horizon = None
+    if horizon not in {1, 5, 20}:
+        errors.append("sentiment horizon must be 1, 5, or 20")
+    if item.get("representation", "raw") not in {"raw", "percentile"}:
+        errors.append("sentiment representation must be raw or percentile")
+    if item.get("cutoff", "15:00") != "15:00":
+        errors.append("sentiment cutoff must be 15:00")
+    if item.get("profile", "sentiment-baseline-v1") != "sentiment-baseline-v1":
+        errors.append("unsupported sentiment profile")
     return errors
 
 

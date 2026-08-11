@@ -98,7 +98,8 @@ class DailyReportRunner:
                 message="相同日报已经由另一个运行器处理",
             )
         run_id = claimed["id"]
-        cutoff = "上午收盘 11:30"
+        collection_time = self._local_now(zone)
+        cutoff = "午间行情 {}".format(collection_time.strftime("%H:%M"))
         try:
             snapshots = self._snapshots(items, cutoff, target_date)
         except Exception as exc:

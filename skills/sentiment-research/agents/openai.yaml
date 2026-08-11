@@ -1,0 +1,4 @@
+interface:
+  display_name: "Sentiment Research"
+  short_description: "Structure news and blogger sentiment with traceable evidence"
+  default_prompt: "Analyze selected public or user-submitted content, build dated sentiment factors, and keep strategy changes approval-gated."

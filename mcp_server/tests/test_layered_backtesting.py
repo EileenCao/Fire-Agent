@@ -85,6 +85,16 @@ def test_zero_core_ratio_runs_tactical_only_without_core_buy():
     assert scenario["positions"]["512890"]["core"]["quantity"] == 0
 
 
+def test_layered_close_policy_reports_exact_suspension_warning():
+    bars = _bars([10, 9, 8, 7, 6, 5, 4, 3])
+    bars[-1]["suspended"] = True
+
+    result = BacktestEngine().run(_layered_spec(ratio=0.5), {"512890": bars})
+    warnings = result["scenarios"]["default"]["warnings"]
+
+    assert "512890 2026-01-08 停牌，无法产生或执行交易" in warnings
+
+
 def test_full_tactical_exit_does_not_sell_core_lots():
     base = _full_exit_spec()
     scenario = _scenario(_layered_spec(base=base, ratio=0.3, with_ladder=False), [4, 3, 2, 1, 2, 3, 4, 5])

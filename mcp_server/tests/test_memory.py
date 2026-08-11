@@ -128,6 +128,33 @@ def test_save_memory_rejects_tampered_candidate_hash(tmp_path):
     assert store.list_memories() == []
 
 
+def test_search_memories_indexes_tags(tmp_path):
+    app, store = _app(tmp_path)
+    candidate = _candidate(
+        content="回测报告指标偏好",
+        topic_key="backtest.report_metrics",
+        memory_type="process_preference",
+    )
+    candidate["tags"] = ["cashneutral", "TWR"]
+    prepared = app.call_tool(
+        "prepare_memory", {"candidate": candidate}
+    )["structuredContent"]
+
+    saved = app.call_tool(
+        "save_memory",
+        {
+            "candidate": prepared["candidate"],
+            "approval_hash": prepared["approval_hash"],
+            "user_confirmed": True,
+        },
+    )
+
+    assert saved["isError"] is False
+    assert [item["memory_id"] for item in store.search_memories("cashneutral")] == [
+        saved["structuredContent"]["memory"]["memory_id"]
+    ]
+
+
 def test_confirmed_conflict_supersedes_previous_memory(tmp_path):
     app, store = _app(tmp_path)
     first = app.call_tool(
@@ -177,6 +204,47 @@ def test_confirmed_conflict_supersedes_previous_memory(tmp_path):
     )
     assert forgotten["isError"] is False
     assert store.list_memories()[0]["structured_value"]["value"] == 0.10
+
+
+def test_confirmed_conflict_supersedes_after_store_reopen(tmp_path):
+    app, store = _app(tmp_path)
+    first = app.call_tool(
+        "prepare_memory", {"candidate": _candidate()}
+    )["structuredContent"]
+    first_saved = app.call_tool(
+        "save_memory",
+        {
+            "candidate": first["candidate"],
+            "approval_hash": first["approval_hash"],
+            "user_confirmed": True,
+        },
+    )["structuredContent"]["memory"]
+
+    reopened_store = SQLiteStore(tmp_path / "research.sqlite3")
+    reopened_store.initialize()
+    reopened_app = McpApplication(store=reopened_store)
+    second = reopened_app.call_tool(
+        "prepare_memory",
+        {
+            "candidate": _candidate(
+                content="我的最大组合回撤容忍度改为10%",
+                structured_value={"value": 0.10, "unit": "ratio"},
+            )
+        },
+    )["structuredContent"]
+
+    saved = reopened_app.call_tool(
+        "save_memory",
+        {
+            "candidate": second["candidate"],
+            "approval_hash": second["approval_hash"],
+            "supersedes_ids": [first_saved["memory_id"]],
+            "user_confirmed": True,
+        },
+    )
+
+    assert saved["isError"] is False
+    assert reopened_store.list_memories()[0]["structured_value"]["value"] == 0.10
 
 
 def test_memory_context_prefers_specific_scope_and_marks_review_due(tmp_path):
@@ -376,11 +444,12 @@ def test_memory_import_preview_detects_active_topic_conflict(tmp_path):
         "prepare_memory",
         {
             "candidate": _candidate(
-                content="鏂扮殑鍥炴挙鍋忓ソ",
+                content="新的回撤偏好",
                 structured_value={"value": 0.08, "unit": "ratio"},
             )
         },
     )["structuredContent"]
+    assert conflicting["candidate"]["content"] == "新的回撤偏好"
     other_app.call_tool(
         "save_memory",
         {

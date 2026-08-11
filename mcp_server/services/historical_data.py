@@ -220,6 +220,7 @@ class AStockDailyBarsFetcher:
         timeout: int = 20,
         segment_days: int = 365,
         max_rows: int = 640,
+        bypass_proxy: bool = True,
     ):
         if session is None:
             try:
@@ -232,6 +233,7 @@ class AStockDailyBarsFetcher:
                     "自动获取历史数据需要 requests；请按 a-stock-data Skill 安装依赖"
                 ) from exc
         self.session = session
+        self.session.trust_env = not bypass_proxy
         self.timeout = timeout
         if segment_days < 1:
             raise ValueError("Tencent historical segment_days must be positive")

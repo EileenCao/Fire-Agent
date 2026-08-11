@@ -500,7 +500,7 @@ class BacktestEngine:
                         cash_flows.append(flow)
 
             if suspended:
-                warnings.append("{} {} 鍋滅墝锛屾棤娉曚骇鐢熸垨鎵ц浜ゆ槗".format(code, day))
+                warnings.append("{} {} 停牌，无法产生或执行交易".format(code, day))
             else:
                 plan = build_signal_plan(
                     spec,
@@ -553,7 +553,7 @@ class BacktestEngine:
             market_value_curve[day] = book.market_value(float(bar["close"]))
 
         if book.total_quantity() > 0:
-            warnings.append("{} 鏁版嵁缁撴潫鏃朵粛鏈夋湭骞充粨澶村锛屾寜鏈€鍚庢敹鐩樹环浼板€?".format(code))
+            warnings.append("{} 数据结束时仍有未平仓头寸，按最后收盘价估值".format(code))
         return {
             "trades": trades,
             "equity_curve": equity_curve,
@@ -618,7 +618,7 @@ class BacktestEngine:
                 fibonacci_result = resolve_fibonacci_level(spec, fibonacci_state)
 
             if suspended:
-                warnings.append("{} {} 鍋滅墝锛屾棤娉曚骇鐢熸垨鎵ц浜ゆ槗".format(code, day))
+                warnings.append("{} {} 停牌，无法产生或执行交易".format(code, day))
             else:
                 if exit_mode == "recovery" and ladder_state is not None:
                     recovery_result = resolve_recovery_levels(

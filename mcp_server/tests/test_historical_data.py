@@ -13,6 +13,15 @@ class _Skill:
     version = "3.6.0"
 
 
+def test_tencent_daily_bars_fetcher_bypasses_environment_proxy_by_default():
+    import requests
+
+    session = requests.Session()
+    AStockDailyBarsFetcher(session=session)
+
+    assert session.trust_env is False
+
+
 class _FakeCache:
     def __init__(self, root):
         self.root = Path(root)

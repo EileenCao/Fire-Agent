@@ -20,6 +20,27 @@ def test_watchlist_round_trip_normalizes_code_and_preserves_type(tmp_path):
     assert store.list_watchlist() == [item]
 
 
+def test_external_position_round_trip_is_workspace_state(tmp_path):
+    store = SQLiteStore(tmp_path / "research.sqlite3")
+    store.initialize()
+
+    position = store.save_external_position(
+        code="512890",
+        vehicle="代持场外基金",
+        tracking_mode="direct_copy",
+        market_value=31033,
+        unrealized_pnl=18,
+        as_of="2026-08-11T11:30:00+08:00",
+        cutoff_time="15:00",
+    )
+
+    assert position["code"] == "512890"
+    assert position["market_value"] == 31033.0
+    assert position["unrealized_pnl"] == 18.0
+    assert position["tracking_mode"] == "direct_copy"
+    assert store.get_external_position("512890") == position
+
+
 def test_schedule_round_trip_uses_noon_send_window(tmp_path):
     store = SQLiteStore(tmp_path / "research.sqlite3")
     store.initialize()

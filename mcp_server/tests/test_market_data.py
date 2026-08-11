@@ -23,6 +23,15 @@ class _Session:
         return _Response(self.raw)
 
 
+def test_tencent_provider_bypasses_environment_proxy_by_default():
+    import requests
+
+    session = requests.Session()
+    TencentMarketDataProvider(session=session, skill=None)
+
+    assert session.trust_env is False
+
+
 def test_tencent_parser_extracts_quote_fields_and_quote_time():
     values = [""] * 53
     values[1] = "红利ETF"

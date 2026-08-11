@@ -14,11 +14,13 @@ from mcp_server.dependencies import AStockDataSkillError, require_a_stock_data_s
 from mcp_server.runtime import (
     build_calendar,
     build_historical_data_provider,
+    build_instrument_research_provider,
     build_market_provider,
     build_notifier,
     build_store,
     load_local_env,
 )
+from mcp_server.server import McpApplication
 from mcp_server.services.runner import DailyReportRunner
 from mcp_server.services.morning_report import build_morning_strategy_signal_builder
 from mcp_server.services.artifacts import write_backtest_artifacts
@@ -27,6 +29,7 @@ from mcp_server.services.backtest_pipeline import (
     enrich_backtest_result,
 )
 from mcp_server.services.backtesting import BacktestEngine
+from mcp_server.services.research import InstrumentResearchService
 from mcp_server.services.historical_data import (
     HistoricalDataError,
     attach_data_provenance,
@@ -72,6 +75,17 @@ def main(argv=None) -> int:
         return 0
     if args.command == "watchlist-list":
         _print_json([asdict(item) for item in store.list_watchlist()])
+        return 0
+    if args.command == "research":
+        return _research_command(args, root, workspace, store)
+    if args.command == "research-list":
+        _print_json(
+            store.list_research_snapshots(
+                code=args.code,
+                market=args.market,
+                limit=args.limit,
+            )
+        )
         return 0
     if args.command == "memory-list":
         _print_json(
@@ -187,6 +201,7 @@ def main(argv=None) -> int:
             strategy_signal_builder = build_morning_strategy_signal_builder(
                 strategy_path,
                 build_historical_data_provider(root),
+                external_position_provider=store.get_external_position,
             )
         runner = DailyReportRunner(
             store=store,
@@ -239,6 +254,27 @@ def _parser():
     remove.add_argument("code")
     remove.add_argument("--market", choices=["SH", "SZ", "BJ"])
     subparsers.add_parser("watchlist-list", help="列出观察清单")
+
+    research = subparsers.add_parser("research", help="生成一个标的研究卡")
+    research.add_argument("code")
+    research.add_argument("--market", choices=["SH", "SZ", "BJ"])
+    research.add_argument("--instrument-type", choices=["STOCK", "ETF"])
+    research.add_argument("--name")
+    research.add_argument("--provider-id", default="a-stock-data")
+    research.add_argument("--as-of", help="YYYY-MM-DD")
+    research.add_argument("--refresh", action="store_true")
+    research.add_argument("--sections", help="逗号分隔，例如 market,bars,valuation")
+    research.add_argument("--strategy-id")
+    research.add_argument("--strategy-version")
+    research.add_argument("--analysis-mode", choices=["single", "debate"], default="single")
+    research.add_argument("--include-watchlist", action="store_true")
+    research.add_argument("--include-memory", action="store_true")
+    research.add_argument("--memory-query")
+
+    research_list = subparsers.add_parser("research-list", help="列出历史研究快照")
+    research_list.add_argument("--code")
+    research_list.add_argument("--market", choices=["SH", "SZ", "BJ"])
+    research_list.add_argument("--limit", type=int, default=20)
 
     memory_list = subparsers.add_parser("memory-list", help="列出长期记忆")
     memory_list.add_argument("--include-inactive", action="store_true")
@@ -381,6 +417,51 @@ def _init_workspace(root: Path, workspace_path: Path, overwrite: bool) -> int:
 
 def _print_json(value) -> None:
     print(json.dumps(value, ensure_ascii=False, indent=2, default=str))
+
+
+def _research_command(args, root: Path, workspace, store) -> int:
+    try:
+        # Keep the production dependency gate explicit even when the Provider
+        # is later replaced by a test double or another explicitly selected id.
+        require_a_stock_data_skill()
+        provider = build_instrument_research_provider(root)
+        application = McpApplication(
+            store=store,
+            research_service=InstrumentResearchService(provider),
+            artifact_root=workspace.root / "artifacts",
+        )
+        sections = (
+            [item.strip() for item in args.sections.split(",") if item.strip()]
+            if args.sections
+            else None
+        )
+        result = application.call_tool(
+            "research_instrument",
+            {
+                "code": args.code,
+                "market": args.market,
+                "instrument_type": args.instrument_type,
+                "name": args.name,
+                "provider_id": args.provider_id if args.provider_id != "a-stock-data" else None,
+                "as_of": args.as_of,
+                "refresh": args.refresh,
+                "sections": sections,
+                "strategy_id": args.strategy_id,
+                "strategy_version": args.strategy_version,
+                "analysis_mode": args.analysis_mode,
+                "include_watchlist": args.include_watchlist,
+                "include_memory": args.include_memory,
+                "memory_query": args.memory_query,
+            },
+        )
+        if result.get("isError"):
+            _print_json({"status": "failed", "error": result["structuredContent"].get("error")})
+            return 2
+        _print_json(result["structuredContent"])
+        return 0
+    except (AStockDataSkillError, OSError, ValueError, TypeError, RuntimeError) as exc:
+        _print_json({"status": "failed", "error": str(exc)})
+        return 2
 
 
 def _safe_print(value) -> None:

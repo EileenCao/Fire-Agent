@@ -30,7 +30,7 @@ def test_report_contains_morning_cutoff_source_and_valuation():
         snapshots=[snapshot],
     )
 
-    assert "截至上午收盘 11:30" in report.content
+    assert "数据截止上午收盘 11:30" in report.content
     assert "512890" in report.content
     assert "红利ETF" in report.content
     assert "PE(TTM)" in report.content

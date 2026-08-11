@@ -55,7 +55,9 @@ def parse_tencent_quote_response(
 class TencentMarketDataProvider:
     """Fetch real-time/paused-session quotes for the watchlist."""
 
-    def __init__(self, session=None, timeout: int = 10, skill=None):
+    def __init__(
+        self, session=None, timeout: int = 10, skill=None, bypass_proxy: bool = True
+    ):
         if session is None:
             try:
                 import requests
@@ -65,6 +67,7 @@ class TencentMarketDataProvider:
             except ImportError as exc:
                 raise RuntimeError("请先安装 requests，或注入兼容的 HTTP session") from exc
         self.session = session
+        self.session.trust_env = not bypass_proxy
         self.timeout = timeout
         self.skill = skill
 

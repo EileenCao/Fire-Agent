@@ -14,7 +14,7 @@ from mcp_server.services.signal_planner import build_signal_plan
 
 
 class MorningStrategySignalEvaluator:
-    """Replay prior bars, then evaluate one synthetic 11:30 signal bar."""
+    """Replay prior bars, then evaluate one synthetic current-noon signal bar."""
 
     mode = "morning_close_approximation"
 

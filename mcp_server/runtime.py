@@ -6,6 +6,9 @@ from typing import Dict, Optional
 
 from mcp_server.adapters.a_stock_data import TencentMarketDataProvider
 from mcp_server.adapters.feishu import FeishuWebhookClient
+from mcp_server.adapters.instrument_research import AStockDataInstrumentProvider
+from mcp_server.adapters.public_web_sentiment import PublicWebSentimentProvider
+from mcp_server.adapters.sentiment import AStockDataSentimentProvider
 from mcp_server.calendar import TradingCalendar
 from mcp_server.dependencies import require_a_stock_data_skill
 from mcp_server.services.historical_data import WorkspaceHistoricalDataProvider
@@ -72,6 +75,38 @@ def build_historical_data_provider(project_root: Optional[Path] = None):
     workspace = load_workspace(root, required=True)
     skill = require_a_stock_data_skill()
     return WorkspaceHistoricalDataProvider(workspace=workspace, skill=skill)
+
+
+def build_instrument_research_provider(project_root: Optional[Path] = None):
+    """Compose the default research Provider from the required a-stock-data sources."""
+
+    root = project_root or Path.cwd()
+    skill = require_a_stock_data_skill()
+    return AStockDataInstrumentProvider(
+        market_provider=build_market_provider(root),
+        historical_data_provider=build_historical_data_provider(root),
+        skill=skill,
+    )
+
+
+def build_sentiment_provider(
+    project_root: Optional[Path] = None, instrument_provider=None
+):
+    """Build the explicit a-stock-data sentiment adapter."""
+
+    provider = instrument_provider or build_instrument_research_provider(project_root)
+    return AStockDataSentimentProvider(provider)
+
+
+def build_sentiment_providers(
+    project_root: Optional[Path] = None, instrument_provider=None
+):
+    return {
+        "a-stock-data": build_sentiment_provider(
+            project_root, instrument_provider=instrument_provider
+        ),
+        "public-web": PublicWebSentimentProvider(),
+    }
 
 
 def build_calendar(

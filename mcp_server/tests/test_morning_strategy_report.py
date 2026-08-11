@@ -68,8 +68,28 @@ def test_daily_report_renders_strategy_signal_section():
         "mode": "morning_close_approximation",
         "strategy_id": "etf-512890-core-rsi-profit-0",
         "strategy_version": "1.3.0-profit0",
-        "signal": {"buy_cash": 1000, "sell_quantity": 0, "evidence": {}},
+        "signal": {
+            "buy_cash": 1000,
+            "sell_quantity": 0,
+            "evidence": {
+                "ladder": {
+                    "state": {
+                        "anchor_price": 1.5,
+                        "current_close": 1.2,
+                        "drawdown_pct": 0.2,
+                        "history_count": 120,
+                    }
+                }
+            },
+        },
         "state": {"cash": 49000, "total_quantity": 1000},
+        "external_position": {
+            "vehicle": "代持场外基金",
+            "market_value": 31033.0,
+            "unrealized_pnl": 18.0,
+            "as_of": "2026-08-11T11:30:00+08:00",
+            "cutoff_time": "15:00",
+        },
     }
 
     report = DailyReportBuilder().build(
@@ -79,6 +99,12 @@ def test_daily_report_renders_strategy_signal_section():
     assert "## 策略信号" in report.content
     assert "BUY" in report.content
     assert "1.3.0-profit0" in report.content
+    assert "真实外部持仓" in report.content
+    assert "31033.0元" in report.content
+    assert "15:00" in report.content
+    assert "最高点回撤" in report.content
+    assert "1.500元" in report.content
+    assert "20.00%" in report.content
 
 
 def test_write_daily_report_persists_markdown_file(tmp_path):
@@ -122,3 +148,45 @@ def test_runtime_builder_uses_fixed_strategy_and_snapshot_price():
 
     assert result[0]["strategy_version"] == "1.3.0-profit0"
     assert result[0]["signal"]["evidence"]["morning_price"] == 49.0
+
+
+def test_runtime_builder_attaches_external_position_without_replacing_simulation():
+    snapshot = MarketSnapshot(
+        code="512890", name="测试ETF", instrument_type="ETF", price=49.0,
+        last_close=50.0, change_pct=-2.0, amount_wan=1.0, turnover_pct=0.1,
+        pe_ttm=10.0, pb=1.0, as_of=None, source_name="fixture", source_url=None,
+    )
+    builder = build_morning_strategy_signal_builder(
+        Path(r"D:\Life_lover\FIRE计划\FireAgentWorkspace\strategies\512890-core-rsi-profit-0.json"),
+        _HistoricalProvider(),
+        external_position_provider=lambda code: {
+            "code": code, "market_value": 31033.0, "unrealized_pnl": 18.0,
+            "vehicle": "代持场外基金", "tracking_mode": "direct_copy",
+        },
+    )
+
+    result = builder([], [snapshot], date(2026, 8, 10))[0]
+
+    assert result["external_position"]["market_value"] == 31033.0
+    assert result["state"]["market_value"] != 31033.0
+
+
+def test_runtime_builder_keeps_external_position_when_market_data_is_unavailable():
+    snapshot = MarketSnapshot(
+        code="512890", name="测试ETF", instrument_type="ETF", price=None,
+        last_close=None, change_pct=None, amount_wan=None, turnover_pct=None,
+        pe_ttm=None, pb=None, as_of=None, source_name="fixture", source_url=None,
+        status="partial", errors=["行情不可用"],
+    )
+    builder = build_morning_strategy_signal_builder(
+        Path(r"D:\Life_lover\FIRE计划\FireAgentWorkspace\strategies\512890-core-rsi-profit-0.json"),
+        _HistoricalProvider(),
+        external_position_provider=lambda code: {
+            "code": code, "market_value": 31033.0, "unrealized_pnl": 18.0,
+        },
+    )
+
+    result = builder([], [snapshot], date(2026, 8, 11))[0]
+
+    assert result["action"] == "UNDETERMINED"
+    assert result["external_position"]["market_value"] == 31033.0

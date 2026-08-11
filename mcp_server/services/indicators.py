@@ -30,13 +30,16 @@ def wilder_rsi(values: Sequence[float], period: int) -> List[Optional[float]]:
 
 
 def build_indicator_series(spec, bars: Sequence[Mapping[str, Any]]) -> Dict[str, List[Optional[float]]]:
-    """Build daily-aligned series for the RSI definitions in a strategy."""
+    """Build daily-aligned series for RSI and sentiment definitions."""
 
     normalized_bars = list(bars)
     closes = [float(bar["close"]) for bar in normalized_bars]
     result: Dict[str, List[Optional[float]]] = {}
     for definition in getattr(spec, "indicators", []) or []:
         indicator_id = str(definition["id"])
+        if definition.get("type") == "sentiment":
+            result[indicator_id] = _sentiment_series(definition, normalized_bars)
+            continue
         if definition.get("type") != "rsi":
             raise ValueError("unsupported indicator type: {}".format(definition.get("type")))
         period = int(definition["period"])
@@ -49,6 +52,25 @@ def build_indicator_series(spec, bars: Sequence[Mapping[str, Any]]) -> Dict[str,
                 "unsupported RSI timeframe: {}".format(definition.get("timeframe"))
             )
     return result
+
+
+def _sentiment_series(
+    definition: Mapping[str, Any], bars: Sequence[Mapping[str, Any]]
+) -> List[Optional[float]]:
+    factor = str(definition.get("factor") or "")
+    representation = str(definition.get("representation") or "raw")
+    value_key = "percentile" if representation == "percentile" else "value"
+    values: List[Optional[float]] = []
+    for bar in bars:
+        item = (bar.get("sentiment_factors") or {}).get(factor)
+        if isinstance(item, Mapping) and item.get("horizons"):
+            item = item.get("horizons", {}).get(str(definition.get("horizon")), item)
+        value = item.get(value_key) if isinstance(item, Mapping) else item
+        try:
+            values.append(float(value) if value is not None else None)
+        except (TypeError, ValueError):
+            values.append(None)
+    return values
 
 
 def _completed_weekly_rsi(

@@ -126,6 +126,17 @@ def test_close_policy_repeats_buy_while_holding():
     assert all(item["cash_after"] >= 0 for item in buys)
 
 
+def test_close_policy_reports_exact_suspension_and_terminal_position_warnings():
+    bars = _bars([10, 9, 8, 7, 6, 5, 4, 3])
+    bars[-1]["suspended"] = True
+
+    result = BacktestEngine().run(_close_rsi_spec(), {"512890": bars})
+    warnings = result["scenarios"]["default"]["warnings"]
+
+    assert "512890 2026-01-08 停牌，无法产生或执行交易" in warnings
+    assert "512890 数据结束时仍有未平仓头寸，按最后收盘价估值" in warnings
+
+
 def test_one_condition_sell_is_a_rounded_partial_sale():
     closes = [12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2] + list(range(3, 20))
     scenario = _scenario(_close_rsi_spec(), closes)
